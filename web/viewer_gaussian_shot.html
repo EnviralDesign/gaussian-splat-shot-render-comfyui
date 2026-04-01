@@ -1,0 +1,1509 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gaussian Shot Viewer</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        :root { --gs-ar: 1; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #101010; color: #ddd; font-family: "Segoe UI", sans-serif; }
+        /* Letterboxed stage: aspect ratio = output width/height (matches raster) */
+        #root {
+            container-type: size;
+            width: 100%;
+            height: 100%;
+            position: relative;
+            background: #101010;
+        }
+        #stage-wrap {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+        }
+        #stage {
+            position: relative;
+            width: min(100cqw, calc(100cqh * var(--gs-ar)));
+            height: min(100cqh, calc(100cqw / var(--gs-ar)));
+            max-width: 100%;
+            max-height: 100%;
+            pointer-events: auto;
+            touch-action: none;
+        }
+        #canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            background: #101010;
+            vertical-align: top;
+        }
+        /* 2D overlay: world XYZ crosshair at pivot, projected with same intrinsics as WebGL view. */
+        #pivotCrossOverlay {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 3;
+        }
+        #hud {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            padding: 8px 10px;
+            background: rgba(0, 0, 0, 0.65);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 6px;
+            font-size: 11px;
+            line-height: 1.35;
+            max-width: calc(100% - 16px);
+            pointer-events: none;
+            z-index: 5;
+        }
+        #lockOverlay {
+            position: absolute;
+            inset: 0;
+            display: none;
+            z-index: 4;
+            cursor: default;
+        }
+        #error {
+            position: absolute;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            background: rgba(0, 0, 0, 0.82);
+            color: #ffb3b3;
+            text-align: center;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div id="root">
+        <div id="stage-wrap">
+            <div id="stage">
+                <canvas id="canvas"></canvas>
+                <canvas id="pivotCrossOverlay" aria-hidden="true"></canvas>
+                <div id="lockOverlay"></div>
+                <div id="hud">Waiting for node execution.</div>
+                <div id="error"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function loadScriptCandidates(candidates) {
+            return new Promise((resolve, reject) => {
+                const tryNext = (index) => {
+                    if (index >= candidates.length) {
+                        reject(new Error("Unable to load gsplat bundle"));
+                        return;
+                    }
+                    const script = document.createElement("script");
+                    script.src = candidates[index];
+                    script.onload = () => resolve();
+                    script.onerror = () => {
+                        script.remove();
+                        tryNext(index + 1);
+                    };
+                    document.head.appendChild(script);
+                };
+                tryNext(0);
+            });
+        }
+    </script>
+
+    <script type="module">
+        const canvas = document.getElementById("canvas");
+        const pivotCrossCanvas = document.getElementById("pivotCrossOverlay");
+        const pivotCrossCtx = pivotCrossCanvas ? pivotCrossCanvas.getContext("2d", { alpha: true }) : null;
+        const hud = document.getElementById("hud");
+        const errorEl = document.getElementById("error");
+        const lockOverlay = document.getElementById("lockOverlay");
+
+        const GSPLAT_CANDIDATES = [
+            "/extensions/ComfyUI-GeometryPack/js/gsplat-bundle.js",
+            "/extensions/comfyui-geometrypack/js/gsplat-bundle.js",
+        ];
+
+        const RAD_TO_DEG = 180 / Math.PI;
+        const ORBIT_STEP_RAD = 0.003;
+        const WHEEL_STEP = 0.001;
+
+        let SPLAT = null;
+        let scene = null;
+        let camera = null;
+        let renderer = null;
+        let controls = null;
+        let currentSplat = null;
+        let originalScales = null;
+        let originalColors = null;
+        let uiPayload = null;
+        let nodeState = null;
+        let currentPreviewState = null;
+        let pointerTracker = null;
+        let lastLoadedUrl = "";
+        /** Serialized: overlapping LoadAsync + scene clears detach ArrayBuffers inside gsplat. */
+        let gaussianLoadChain = Promise.resolve();
+        /** Serialize full postMessage handling (parent polls ~150ms; parallel runs interleave with WASM/worker setup). */
+        let stateHandleChain = Promise.resolve();
+        let lastLockState = false;
+        /** When server returns a new preview_camera_state JSON, re-snap viewport to raster truth. */
+        let lastServerPreviewCameraJson = "";
+        let raf = null;
+        let needsRender = true;
+        let renderFramesRemaining = 0;
+        let maxGaussiansTimer = null;
+        let lastMaxGaussiansCapSig = "";
+
+        function requestRender(frames = 2) {
+            needsRender = true;
+            renderFramesRemaining = Math.max(renderFramesRemaining, frames);
+        }
+
+        function showError(message) {
+            errorEl.style.display = "flex";
+            errorEl.textContent = message;
+        }
+
+        function hideError() {
+            errorEl.style.display = "none";
+            errorEl.textContent = "";
+        }
+
+        function parseJson(value, fallback) {
+            try {
+                return JSON.parse(value);
+            } catch {
+                return fallback;
+            }
+        }
+
+        function clamp(value, min, max) {
+            return Math.max(min, Math.min(max, value));
+        }
+
+        /**
+         * Match raster / Comfy output: dimensions from widgets, or last render_size when
+         * use_source_resolution (SHARP source size). Focal lengths scale when width/height change before re-run.
+         */
+        function getEffectiveRenderSize() {
+            const rs = parseJson(uiPayload?.render_size?.[0] || "{}", {});
+            const useSrc = !!nodeState?.use_source_resolution;
+            let rw;
+            let rh;
+            if (useSrc && rs.width > 0 && rs.height > 0) {
+                rw = Math.max(rs.width | 0, 1);
+                rh = Math.max(rs.height | 0, 1);
+            } else {
+                let w = parseInt(nodeState?.output_width, 10);
+                let h = parseInt(nodeState?.output_height, 10);
+                if (!Number.isFinite(w) || w <= 0) {
+                    w = 1024;
+                }
+                if (!Number.isFinite(h) || h <= 0) {
+                    h = 1024;
+                }
+                rw = w;
+                rh = h;
+            }
+
+            const sw = rs.width > 0 ? Number(rs.width) : 0;
+            const sh = rs.height > 0 ? Number(rs.height) : 0;
+            const sfx = rs.fx > 0 ? Number(rs.fx) : 0;
+            const sfy = rs.fy > 0 ? Number(rs.fy) : 0;
+
+            /* Match Python _resolve_intrinsics: square pixels (fx === fy) so FOV follows aspect. */
+            let fx;
+            let fy;
+            if (sw > 0 && sh > 0 && sfx > 0 && sfy > 0) {
+                const fRef = 0.5 * (sfx + sfy);
+                const minSrc = Math.min(sw, sh);
+                const minOut = Math.min(rw, rh);
+                const f = fRef * (minOut / Math.max(minSrc, 1));
+                fx = f;
+                fy = f;
+            } else {
+                const f = 0.9 * Math.min(rw, rh);
+                fx = f;
+                fy = f;
+            }
+            return {
+                width: rw,
+                height: rh,
+                fx,
+                fy,
+                cx: rw * 0.5,
+                cy: rh * 0.5,
+            };
+        }
+
+        function deg2rad(value) {
+            return (value * Math.PI) / 180.0;
+        }
+
+        function isCameraLocked() {
+            return !!nodeState?.camera_locked;
+        }
+
+        function setLockOverlay(locked) {
+            lockOverlay.style.display = locked ? "block" : "none";
+        }
+
+        function hashUnit(seed, stream) {
+            let x = ((Number(seed) >>> 0) ^ (((stream * 0x9e3779b9) >>> 0))) >>> 0;
+            x ^= x >>> 16;
+            x = Math.imul(x, 0x7feb352d) >>> 0;
+            x ^= x >>> 15;
+            x = Math.imul(x, 0x846ca68b) >>> 0;
+            x ^= x >>> 16;
+            return x / 4294967295.0;
+        }
+
+        /** Uniform in [vmin, vmax]; same streams as Python _rand_in_range / _hash_unit. */
+        function randInRange(seed, stream, vmin, vmax) {
+            return vmin + (vmax - vmin) * hashUnit(seed, stream);
+        }
+
+        function stripExplicitCamPos(obj) {
+            if (!obj || typeof obj !== "object") {
+                return obj;
+            }
+            const o = { ...obj };
+            delete o.cam_pos_x;
+            delete o.cam_pos_y;
+            delete o.cam_pos_z;
+            for (let i = 0; i < 3; i++) {
+                for (let j = 0; j < 3; j++) {
+                    delete o[`cam_r${i}${j}`];
+                }
+            }
+            return o;
+        }
+
+        function matMul3(a, b) {
+            const out = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+            for (let i = 0; i < 3; i++) {
+                for (let j = 0; j < 3; j++) {
+                    out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+                }
+            }
+            return out;
+        }
+
+        function matVec3(m, v) {
+            return [
+                m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+                m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+                m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+            ];
+        }
+
+        function cross3(a, b) {
+            return [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ];
+        }
+
+        function normalize3(v) {
+            const n = Math.hypot(v[0], v[1], v[2]) || 1;
+            return [v[0] / n, v[1] / n, v[2] / n];
+        }
+
+        function transpose3(m) {
+            return [
+                [m[0][0], m[1][0], m[2][0]],
+                [m[0][1], m[1][1], m[2][1]],
+                [m[0][2], m[1][2], m[2][2]],
+            ];
+        }
+
+        /** R maps camera +Z to world forward; recover yaw/pitch/roll for HUD (matches Python). */
+        function matrixToYawPitchRollDeg(rot) {
+            const f = normalize3(matVec3(rot, [0, 0, 1]));
+            const yaw = Math.atan2(f[0], f[2]) * RAD_TO_DEG;
+            const pitch = Math.asin(clamp(f[1], -1, 1)) * RAD_TO_DEG;
+            const worldUp = [0, 1, 0];
+            const dotUp = f[0] * worldUp[0] + f[1] * worldUp[1] + f[2] * worldUp[2];
+            const refRight = Math.abs(dotUp) > 0.99
+                ? [1, 0, 0]
+                : normalize3(cross3(worldUp, f));
+            const r = matVec3(rot, [1, 0, 0]);
+            const dotRF = r[0] * f[0] + r[1] * f[1] + r[2] * f[2];
+            let rProj = [r[0] - f[0] * dotRF, r[1] - f[1] * dotRF, r[2] - f[2] * dotRF];
+            const rpn = Math.hypot(rProj[0], rProj[1], rProj[2]);
+            let roll = 0;
+            if (rpn >= 1e-8) {
+                rProj = [rProj[0] / rpn, rProj[1] / rpn, rProj[2] / rpn];
+                let refProj = [
+                    refRight[0] - f[0] * (refRight[0] * f[0] + refRight[1] * f[1] + refRight[2] * f[2]),
+                    refRight[1] - f[1] * (refRight[0] * f[0] + refRight[1] * f[1] + refRight[2] * f[2]),
+                    refRight[2] - f[2] * (refRight[0] * f[0] + refRight[1] * f[1] + refRight[2] * f[2]),
+                ];
+                const refLen = Math.hypot(refProj[0], refProj[1], refProj[2]);
+                if (refLen >= 1e-8) {
+                    refProj = [refProj[0] / refLen, refProj[1] / refLen, refProj[2] / refLen];
+                    const c = cross3(refProj, rProj);
+                    roll = Math.atan2(
+                        c[0] * f[0] + c[1] * f[1] + c[2] * f[2],
+                        refProj[0] * rProj[0] + refProj[1] * rProj[1] + refProj[2] * rProj[2],
+                    ) * RAD_TO_DEG;
+                }
+            }
+            return { yaw_deg: yaw, pitch_deg: pitch, roll_deg: roll };
+        }
+
+        /** Match Python _euler_deg_to_matrix / _camera_axes: R = Rz * Ry * Rx on (pitch, yaw, roll) degrees. */
+        function eulerDegToMatrix(pitchDeg, yawDeg, rollDeg) {
+            const ax = deg2rad(pitchDeg);
+            const ay = deg2rad(yawDeg);
+            const az = deg2rad(rollDeg);
+            const cx = Math.cos(ax);
+            const sx = Math.sin(ax);
+            const cy = Math.cos(ay);
+            const sy = Math.sin(ay);
+            const cz = Math.cos(az);
+            const sz = Math.sin(az);
+            const rxm = [
+                [1, 0, 0],
+                [0, cx, -sx],
+                [0, sx, cx],
+            ];
+            const rym = [
+                [cy, 0, sy],
+                [0, 1, 0],
+                [-sy, 0, cy],
+            ];
+            const rzm = [
+                [cz, -sz, 0],
+                [sz, cz, 0],
+                [0, 0, 1],
+            ];
+            return matMul3(matMul3(rzm, rym), rxm);
+        }
+
+        function cameraAxes(yawDeg, pitchDeg, rollDeg) {
+            const m = eulerDegToMatrix(pitchDeg, yawDeg, rollDeg);
+            const r = matVec3(m, [1, 0, 0]);
+            const d = matVec3(m, [0, 1, 0]);
+            const f = matVec3(m, [0, 0, 1]);
+            return {
+                right: { x: r[0], y: r[1], z: r[2] },
+                down: { x: d[0], y: d[1], z: d[2] },
+                forward: { x: f[0], y: f[1], z: f[2] },
+            };
+        }
+
+        function stateToCamera(state) {
+            const pivot = new SPLAT.Vector3(state.pivot_x, state.pivot_y, state.pivot_z);
+            let position;
+            if (
+                Number.isFinite(state.cam_pos_x)
+                && Number.isFinite(state.cam_pos_y)
+                && Number.isFinite(state.cam_pos_z)
+            ) {
+                position = new SPLAT.Vector3(state.cam_pos_x, state.cam_pos_y, state.cam_pos_z);
+            } else {
+                const { forward } = cameraAxes(state.yaw_deg, state.pitch_deg, state.roll_deg);
+                position = new SPLAT.Vector3(
+                    pivot.x - forward.x * state.distance,
+                    pivot.y - forward.y * state.distance,
+                    pivot.z - forward.z * state.distance
+                );
+            }
+            return { pivot, position };
+        }
+
+        function syncIntrinsics() {
+            resizePivotCrossOverlay();
+            if (!camera || !renderer) {
+                return;
+            }
+            const renderInfo = getEffectiveRenderSize();
+            const ar = renderInfo.width / Math.max(renderInfo.height, 1);
+            document.documentElement.style.setProperty("--gs-ar", String(ar));
+            const targetWidth = Math.max(renderInfo.width || canvas.clientWidth || 1024, 1);
+            const targetHeight = Math.max(renderInfo.height || canvas.clientHeight || 1024, 1);
+            const drawWidth = Math.max(canvas.clientWidth || targetWidth, 1);
+            const drawHeight = Math.max(canvas.clientHeight || targetHeight, 1);
+            renderer.setSize(drawWidth, drawHeight);
+            camera.data.fx = renderInfo.fx * (drawWidth / targetWidth);
+            camera.data.fy = renderInfo.fy * (drawHeight / targetHeight);
+        }
+
+        function resizePivotCrossOverlay() {
+            if (!canvas || !pivotCrossCanvas || !pivotCrossCtx) {
+                return;
+            }
+            const dpr = window.devicePixelRatio || 1;
+            const w = Math.max(canvas.clientWidth | 0, 1);
+            const h = Math.max(canvas.clientHeight | 0, 1);
+            pivotCrossCanvas.width = Math.round(w * dpr);
+            pivotCrossCanvas.height = Math.round(h * dpr);
+            pivotCrossCanvas.style.width = `${w}px`;
+            pivotCrossCanvas.style.height = `${h}px`;
+            pivotCrossCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+
+        /** Rows: camera right / down / forward in world (matches cam_r** and CPU r_wc). */
+        function getViewBasisRowsFromState(st) {
+            if (st && Number.isFinite(st.cam_r00)) {
+                return [
+                    [st.cam_r00, st.cam_r01, st.cam_r02],
+                    [st.cam_r10, st.cam_r11, st.cam_r12],
+                    [st.cam_r20, st.cam_r21, st.cam_r22],
+                ];
+            }
+            const ax = cameraAxes(st.yaw_deg, st.pitch_deg, st.roll_deg);
+            return [
+                [ax.right.x, ax.right.y, ax.right.z],
+                [ax.down.x, ax.down.y, ax.down.z],
+                [ax.forward.x, ax.forward.y, ax.forward.z],
+            ];
+        }
+
+        /** Pinhole projection consistent with getEffectiveRenderSize + gsplat camera; returns CSS pixels. */
+        function projectWorldPointToCanvas(wx, wy, wz, st) {
+            if (!camera?.position || !st) {
+                return null;
+            }
+            const cp = camera.position;
+            const rel = [wx - cp.x, wy - cp.y, wz - cp.z];
+            const b = getViewBasisRowsFromState(st);
+            const xc = rel[0] * b[0][0] + rel[1] * b[0][1] + rel[2] * b[0][2];
+            const yc = rel[0] * b[1][0] + rel[1] * b[1][1] + rel[2] * b[1][2];
+            const zc = rel[0] * b[2][0] + rel[1] * b[2][1] + rel[2] * b[2][2];
+            if (zc <= 1e-3) {
+                return null;
+            }
+            const ri = getEffectiveRenderSize();
+            const cw = Math.max(canvas.clientWidth | 0, 1);
+            const ch = Math.max(canvas.clientHeight | 0, 1);
+            const tw = Math.max(ri.width | 0, 1);
+            const th = Math.max(ri.height | 0, 1);
+            const fxS = ri.fx * (cw / tw);
+            const fyS = ri.fy * (ch / th);
+            const cxS = ri.cx * (cw / tw);
+            const cyS = ri.cy * (ch / th);
+            const u = fxS * (xc / zc) + cxS;
+            const v = fyS * (yc / zc) + cyS;
+            return { x: u, y: v };
+        }
+
+        /** World-axis crosshair at pivot (perspective-correct); drawn after splats. */
+        function drawPivotWorldCrosshair() {
+            if (!pivotCrossCtx || !camera?.position) {
+                return;
+            }
+            const cw = Math.max(canvas.clientWidth | 0, 1);
+            const ch = Math.max(canvas.clientHeight | 0, 1);
+            if (!currentPreviewState) {
+                pivotCrossCtx.clearRect(0, 0, cw, ch);
+                return;
+            }
+            const st = currentPreviewState;
+            pivotCrossCtx.clearRect(0, 0, cw, ch);
+
+            const px = Number(st.pivot_x);
+            const py = Number(st.pivot_y);
+            const pz = Number(st.pivot_z);
+            if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) {
+                return;
+            }
+
+            const cp = camera.position;
+            const dist = Math.hypot(px - cp.x, py - cp.y, pz - cp.z);
+            const arm = clamp(Math.max(dist * 0.038, 0.07), 0.05, 1.8);
+
+            const orange = "#ff7a00";
+            const mint = "#5dff8a";
+            const sky = "#4dd2ff";
+            const axisColor = [orange, mint, sky];
+
+            pivotCrossCtx.lineWidth = 2.5;
+            pivotCrossCtx.lineCap = "round";
+            pivotCrossCtx.shadowColor = "rgba(0,0,0,0.9)";
+            pivotCrossCtx.shadowBlur = 5;
+
+            const drawSeg = (wx0, wy0, wz0, wx1, wy1, wz1, col) => {
+                const a = projectWorldPointToCanvas(wx0, wy0, wz0, st);
+                const b = projectWorldPointToCanvas(wx1, wy1, wz1, st);
+                if (!a || !b) {
+                    return;
+                }
+                pivotCrossCtx.strokeStyle = col;
+                pivotCrossCtx.beginPath();
+                pivotCrossCtx.moveTo(a.x, a.y);
+                pivotCrossCtx.lineTo(b.x, b.y);
+                pivotCrossCtx.stroke();
+            };
+
+            for (let a = 0; a < 3; a++) {
+                const du = [0, 0, 0];
+                du[a] = 1;
+                drawSeg(
+                    px + du[0] * arm,
+                    py + du[1] * arm,
+                    pz + du[2] * arm,
+                    px - du[0] * arm,
+                    py - du[1] * arm,
+                    pz - du[2] * arm,
+                    axisColor[a],
+                );
+            }
+
+            const cen = projectWorldPointToCanvas(px, py, pz, st);
+            if (cen) {
+                pivotCrossCtx.shadowBlur = 4;
+                pivotCrossCtx.fillStyle = "#fff2e0";
+                pivotCrossCtx.beginPath();
+                pivotCrossCtx.arc(cen.x, cen.y, 3.2, 0, Math.PI * 2);
+                pivotCrossCtx.fill();
+            }
+            pivotCrossCtx.shadowBlur = 0;
+        }
+
+        function applyCameraState(state) {
+            if (!state) {
+                return;
+            }
+            /* Commit logical camera first so HUD / state are never stuck if WebGL is not ready yet
+             * (parent can postMessage while this module is still awaiting gsplat) or if PLY load hangs. */
+            currentPreviewState = { ...state };
+            updateHud();
+            if (!camera || !renderer || !controls) {
+                return;
+            }
+            syncIntrinsics();
+            const resolved = stateToCamera(state);
+            camera.position.x = resolved.position.x;
+            camera.position.y = resolved.position.y;
+            camera.position.z = resolved.position.z;
+            camera.raiseChangeEvent?.();
+            controls.setCameraTarget(resolved.pivot);
+            controls.update();
+            requestRender(18);
+            scheduleMaxGaussiansRecompute();
+        }
+
+        function deferredSplatNotify(splat) {
+            if (!splat) {
+                return;
+            }
+            /*
+             * RenderData may still be running deferred buildImmediate (WASM). raiseChangeEvent → markDirty →
+             * build() postMessage-transfers splat.data buffers before buildImmediate reads them → detached.
+             */
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    splat.raiseChangeEvent?.();
+                });
+            });
+        }
+
+        /** 0 = unlimited (viewer + CPU). >0 caps to that many splats by importance heuristic. */
+        function parsedMaxGaussians() {
+            const w = nodeState?.max_gaussians;
+            const fromNode = w !== undefined && w !== null && w !== "" ? parseInt(String(w), 10) : NaN;
+            const p = uiPayload?.max_gaussians?.[0];
+            const fromUi = p !== undefined && p !== null && p !== "" ? parseInt(String(p), 10) : NaN;
+            const n = Number.isFinite(fromNode) ? fromNode : (Number.isFinite(fromUi) ? fromUi : 0);
+            if (!Number.isFinite(n) || n <= 0) {
+                return 0;
+            }
+            return Math.floor(clamp(n, 1, 200000));
+        }
+
+        function maxGaussiansCapSignature() {
+            if (!currentPreviewState) {
+                return "";
+            }
+            const g = Math.max(1e-4, Number(nodeState?.gaussian_scale) || 1.0);
+            const cap = parsedMaxGaussians();
+            const st = currentPreviewState;
+            return [
+                cap,
+                g,
+                st.pivot_x,
+                st.pivot_y,
+                st.pivot_z,
+                st.yaw_deg,
+                st.pitch_deg,
+                st.roll_deg,
+                st.distance,
+                st.cam_pos_x ?? "",
+                st.cam_pos_y ?? "",
+                st.cam_pos_z ?? "",
+                st.cam_r00 ?? "",
+                st.cam_r01 ?? "",
+                st.cam_r02 ?? "",
+                st.cam_r10 ?? "",
+                st.cam_r11 ?? "",
+                st.cam_r12 ?? "",
+                st.cam_r20 ?? "",
+                st.cam_r21 ?? "",
+                st.cam_r22 ?? "",
+            ].join(",");
+        }
+
+        function scheduleMaxGaussiansRecompute() {
+            const sig = maxGaussiansCapSignature();
+            if (!sig) {
+                return;
+            }
+            if (sig === lastMaxGaussiansCapSig) {
+                return;
+            }
+            if (maxGaussiansTimer != null) {
+                clearTimeout(maxGaussiansTimer);
+            }
+            maxGaussiansTimer = setTimeout(() => {
+                maxGaussiansTimer = null;
+                applyMaxGaussiansCap();
+                lastMaxGaussiansCapSig = sig;
+            }, 120);
+        }
+
+        function flushMaxGaussiansRecompute() {
+            if (maxGaussiansTimer != null) {
+                clearTimeout(maxGaussiansTimer);
+                maxGaussiansTimer = null;
+            }
+            applyMaxGaussiansCap();
+            const s = maxGaussiansCapSignature();
+            if (s) {
+                lastMaxGaussiansCapSig = s;
+            }
+        }
+
+        /**
+         * Mirror CPU path: keep top max_gaussians by importance ≈ opacity * radius_projected^2 / z
+         * (radius projected ~ fx * max(scale) / z). Others get alpha 0 in gsplat packed colors.
+         */
+        function applyMaxGaussiansCap() {
+            if (!currentSplat?.data?.positions || !originalColors || !currentPreviewState) {
+                return;
+            }
+            const splat = currentSplat;
+            const data = splat.data;
+            const positions = data.positions;
+            const scales = data.scales;
+            const colors = data.colors;
+            const nRaw = typeof data.vertexCount === "number" && data.vertexCount > 0
+                ? data.vertexCount
+                : (positions.length / 3) | 0;
+            const n = Math.min(nRaw, (originalColors.length / 4) | 0, (positions.length / 3) | 0);
+            const maxG = parsedMaxGaussians();
+            if (maxG <= 0 || maxG >= n) {
+                colors.set(originalColors);
+                splat.data.changed = true;
+                deferredSplatNotify(splat);
+                requestRender(12);
+                return;
+            }
+
+            const renderInfo = getEffectiveRenderSize();
+            const fx = Math.max(Number(renderInfo.fx) || 1024 * 0.9, 1e-3);
+            const st = currentPreviewState;
+            const fwd = Number.isFinite(st.cam_r20)
+                ? { x: st.cam_r20, y: st.cam_r21, z: st.cam_r22 }
+                : cameraAxes(st.yaw_deg, st.pitch_deg, st.roll_deg).forward;
+            const cam = stateToCamera(currentPreviewState);
+            const cpx = cam.position.x;
+            const cpy = cam.position.y;
+            const cpz = cam.position.z;
+
+            const imp = new Float64Array(n);
+            for (let i = 0; i < n; i++) {
+                const i3 = 3 * i;
+                const i4 = 4 * i;
+                const rx = positions[i3] - cpx;
+                const ry = positions[i3 + 1] - cpy;
+                const rz = positions[i3 + 2] - cpz;
+                const z = rx * fwd.x + ry * fwd.y + rz * fwd.z;
+                if (z < 1e-3) {
+                    imp[i] = -1;
+                    continue;
+                }
+                const alpha = originalColors[i4 + 3] / 255;
+                if (alpha <= 1e-4) {
+                    imp[i] = -1;
+                    continue;
+                }
+                const s0 = scales[i3];
+                const s1 = scales[i3 + 1];
+                const s2 = scales[i3 + 2];
+                const smax = Math.max(s0, s1, s2, 1e-6);
+                const radiusPx = Math.min(96, Math.max(1, (3 * fx * smax) / z));
+                imp[i] = (alpha * radiusPx * radiusPx) / z;
+            }
+
+            const order = new Array(n);
+            for (let i = 0; i < n; i++) {
+                order[i] = i;
+            }
+            order.sort((a, b) => imp[b] - imp[a]);
+
+            const keep = new Uint8Array(n);
+            let kept = 0;
+            for (let j = 0; j < n && kept < maxG; j++) {
+                const i = order[j];
+                if (imp[i] > 0) {
+                    keep[i] = 1;
+                    kept++;
+                }
+            }
+            for (let i = 0; i < n; i++) {
+                const o = 4 * i + 3;
+                colors[o] = keep[i] ? originalColors[o] : 0;
+            }
+
+            splat.data.changed = true;
+            deferredSplatNotify(splat);
+            requestRender(12);
+        }
+
+        function applyGaussianScale(scaleValue) {
+            if (!currentSplat?.data?.scales || !originalScales) {
+                return;
+            }
+            const splat = currentSplat;
+            /* Match Python gaussian_shot_node._render_gaussians: sigma scales with gaussian_scale (no viewport fudge). */
+            const scale = Math.max(1e-4, Number(scaleValue) || 1.0);
+            const scales = splat.data.scales;
+            for (let i = 0; i < scales.length; i++) {
+                scales[i] = originalScales[i] * scale;
+            }
+            splat.data.changed = true;
+            deferredSplatNotify(splat);
+            requestRender(12);
+            scheduleMaxGaussiansRecompute();
+        }
+
+        function parseInteractiveCameraState(state) {
+            const parsed = stripExplicitCamPos(parseJson(state?.interactive_state, {}));
+            const d = Number(parsed?.distance);
+            if (!parsed || !Number.isFinite(d) || Math.abs(d) <= 1e-5) {
+                return null;
+            }
+            return {
+                pivot_x: Number.isFinite(Number(parsed.pivot_x)) ? Number(parsed.pivot_x) : 0,
+                pivot_y: Number.isFinite(Number(parsed.pivot_y)) ? Number(parsed.pivot_y) : 0,
+                pivot_z: Number.isFinite(Number(parsed.pivot_z)) ? Number(parsed.pivot_z) : 0,
+                yaw_deg: Number.isFinite(Number(parsed.yaw_deg)) ? Number(parsed.yaw_deg) : 0,
+                pitch_deg: Number.isFinite(Number(parsed.pitch_deg)) ? Number(parsed.pitch_deg) : 0,
+                roll_deg: Number.isFinite(Number(parsed.roll_deg)) ? Number(parsed.roll_deg) : 0,
+                distance: d,
+            };
+        }
+
+        function parameterStateFromUi(state) {
+            const fallback = parseJson(uiPayload?.parameter_camera_state?.[0] || "{}", {});
+            const pivot = {
+                x: Number(state?.pivot_x),
+                y: Number(state?.pivot_y),
+                z: Number(state?.pivot_z),
+            };
+            if (!Number.isFinite(pivot.x)) {
+                pivot.x = 0;
+            }
+            if (!Number.isFinite(pivot.y)) {
+                pivot.y = 0;
+            }
+            if (!Number.isFinite(pivot.z)) {
+                pivot.z = 0;
+            }
+            const rawDist = Number(state?.cam_distance);
+            const distance = Number.isFinite(rawDist) ? rawDist : 0;
+
+            if (Math.abs(distance) > 1e-5) {
+                return {
+                    pivot_x: pivot.x,
+                    pivot_y: pivot.y,
+                    pivot_z: pivot.z,
+                    yaw_deg: Number.isFinite(Number(state?.cam_yaw_deg)) ? Number(state.cam_yaw_deg) : 0,
+                    pitch_deg: Number.isFinite(Number(state?.cam_pitch_deg)) ? Number(state.cam_pitch_deg) : 0,
+                    roll_deg: Number.isFinite(Number(state?.cam_roll_deg)) ? Number(state.cam_roll_deg) : 0,
+                    distance,
+                };
+            }
+
+            const fromInteractive = parseInteractiveCameraState(state);
+            if (fromInteractive) {
+                return fromInteractive;
+            }
+
+            return {
+                ...fallback,
+                pivot_x: pivot.x,
+                pivot_y: pivot.y,
+                pivot_z: pivot.z,
+            };
+        }
+
+        function proceduralStateFromUi(state) {
+            const base = parameterStateFromUi(state);
+            if (!state) {
+                return base;
+            }
+
+            const seed = parseInt(String(state.seed ?? 0), 10) || 0;
+            const dx = randInRange(seed, 1, Number(state.rand_tx_min), Number(state.rand_tx_max));
+            const dy = randInRange(seed, 2, Number(state.rand_ty_min), Number(state.rand_ty_max));
+            const dz = randInRange(seed, 3, Number(state.rand_tz_min), Number(state.rand_tz_max));
+            const dyaw = randInRange(seed, 4, Number(state.rand_yaw_min), Number(state.rand_yaw_max));
+            const dpitch = randInRange(seed, 5, Number(state.rand_pitch_min), Number(state.rand_pitch_max));
+            const droll = randInRange(seed, 6, Number(state.rand_roll_min), Number(state.rand_roll_max));
+            const lpitch = randInRange(seed, 7, Number(state.rand_loc_pitch_min), Number(state.rand_loc_pitch_max));
+            const lyaw = randInRange(seed, 8, Number(state.rand_loc_yaw_min), Number(state.rand_loc_yaw_max));
+            const lroll = randInRange(seed, 9, Number(state.rand_loc_roll_min), Number(state.rand_loc_roll_max));
+
+            const procIdle = (
+                Math.abs(dx) < 1e-8 && Math.abs(dy) < 1e-8 && Math.abs(dz) < 1e-8
+                && Math.abs(dyaw) < 1e-8 && Math.abs(dpitch) < 1e-8 && Math.abs(droll) < 1e-8
+                && Math.abs(lpitch) < 1e-8 && Math.abs(lyaw) < 1e-8 && Math.abs(lroll) < 1e-8
+            );
+            const baseD = Number(base.distance);
+            if (
+                procIdle
+                && Number.isFinite(baseD)
+                && Math.abs(baseD) > 1e-5
+                && Number.isFinite(Number(base.yaw_deg))
+                && Number.isFinite(Number(base.pitch_deg))
+            ) {
+                return {
+                    pivot_x: base.pivot_x,
+                    pivot_y: base.pivot_y,
+                    pivot_z: base.pivot_z,
+                    yaw_deg: Number(base.yaw_deg),
+                    pitch_deg: Number(base.pitch_deg),
+                    roll_deg: Number.isFinite(Number(base.roll_deg)) ? Number(base.roll_deg) : 0,
+                    distance: baseD,
+                };
+            }
+
+            const pivotVec = {
+                x: Number(base.pivot_x),
+                y: Number(base.pivot_y),
+                z: Number(base.pivot_z),
+            };
+            const by = Number(base.yaw_deg);
+            const bp = Number(base.pitch_deg);
+            const br = Number.isFinite(Number(base.roll_deg)) ? Number(base.roll_deg) : 0;
+
+            const rBase = eulerDegToMatrix(bp, by, br);
+            const rWorldDelta = eulerDegToMatrix(dpitch, dyaw, droll);
+            const rMid = matMul3(rWorldDelta, rBase);
+            const rLoc = eulerDegToMatrix(lpitch, lyaw, lroll);
+            const rFinal = matMul3(rMid, rLoc);
+
+            const fwd = normalize3(matVec3(rFinal, [0, 0, 1]));
+            const orbitPos = {
+                x: pivotVec.x - fwd[0] * baseD,
+                y: pivotVec.y - fwd[1] * baseD,
+                z: pivotVec.z - fwd[2] * baseD,
+            };
+            const pos1 = {
+                x: orbitPos.x + dx,
+                y: orbitPos.y + dy,
+                z: orbitPos.z + dz,
+            };
+
+            const ypr = matrixToYawPitchRollDeg(rFinal);
+            const rdx = pivotVec.x - pos1.x;
+            const rdy = pivotVec.y - pos1.y;
+            const rdz = pivotVec.z - pos1.z;
+            const chord = Math.max(Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz), 1e-3);
+
+            const right = matVec3(rFinal, [1, 0, 0]);
+            const down = matVec3(rFinal, [0, 1, 0]);
+            const forward = matVec3(rFinal, [0, 0, 1]);
+            const rWc = [right, down, forward];
+
+            const out = {
+                pivot_x: pivotVec.x,
+                pivot_y: pivotVec.y,
+                pivot_z: pivotVec.z,
+                yaw_deg: ypr.yaw_deg,
+                pitch_deg: ypr.pitch_deg,
+                roll_deg: ypr.roll_deg,
+                distance: chord,
+                cam_pos_x: pos1.x,
+                cam_pos_y: pos1.y,
+                cam_pos_z: pos1.z,
+            };
+            for (let i = 0; i < 3; i++) {
+                for (let j = 0; j < 3; j++) {
+                    out[`cam_r${i}${j}`] = rWc[i][j];
+                }
+            }
+            return out;
+        }
+
+        function interactiveStateFromUi(state) {
+            const sourceState = stripExplicitCamPos(parseJson(uiPayload?.preview_camera_state?.[0] || "{}", {}));
+            const activeState = stripExplicitCamPos(parseJson(uiPayload?.active_camera_state?.[0] || "{}", {}));
+            const parsed = stripExplicitCamPos(parseJson(state?.interactive_state, {}));
+
+            const px = Number(state?.pivot_x);
+            const py = Number(state?.pivot_y);
+            const pz = Number(state?.pivot_z);
+            const piv = {
+                x: Number.isFinite(px) ? px : 0,
+                y: Number.isFinite(py) ? py : 0,
+                z: Number.isFinite(pz) ? pz : 0,
+            };
+
+            const idist = typeof parsed?.distance === "number" ? parsed.distance : NaN;
+            if (!parsed || !Number.isFinite(idist) || Math.abs(idist) <= 1e-5) {
+                const fallback = (activeState && Math.abs(Number(activeState.distance) || 0) > 1e-5)
+                    ? activeState
+                    : sourceState;
+                return {
+                    ...fallback,
+                    pivot_x: piv.x,
+                    pivot_y: piv.y,
+                    pivot_z: piv.z,
+                };
+            }
+
+            return parsed;
+        }
+
+        function serverPreviewDeltaHtml() {
+            /* Locked shots rasterize output_state; ui.preview is still preview_state — compare only in scout. */
+            if (isCameraLocked()) {
+                return "";
+            }
+            const raw = uiPayload?.preview_camera_state?.[0];
+            const srv = typeof raw === "string" && raw ? parseJson(raw, null) : null;
+            if (!srv || typeof srv.distance !== "number" || !currentPreviewState) {
+                return "";
+            }
+            const st = currentPreviewState;
+            const epsA = 0.2;
+            const relD = Math.abs(srv.distance - st.distance) / Math.max(st.distance, 1e-3);
+            if (
+                Math.abs(srv.yaw_deg - st.yaw_deg) < epsA
+                && Math.abs(srv.pitch_deg - st.pitch_deg) < epsA
+                && relD < 0.03
+                && Math.abs(srv.pivot_x - st.pivot_x) < 0.05
+                && Math.abs(srv.pivot_y - st.pivot_y) < 0.05
+                && Math.abs(srv.pivot_z - st.pivot_z) < 0.05
+            ) {
+                return `<div style="opacity:.75">cam ≈ last raster</div>`;
+            }
+            return `<div style="color:#fa0">Δ raster: y ${(srv.yaw_deg - st.yaw_deg).toFixed(1)} p ${(srv.pitch_deg - st.pitch_deg).toFixed(1)} d ${(srv.distance - st.distance).toFixed(2)}</div>`;
+        }
+
+        function fmtFixed(val, decimals) {
+            const n = Number(val);
+            return Number.isFinite(n) ? n.toFixed(decimals) : (0).toFixed(decimals);
+        }
+
+        function updateHud() {
+            if (nodeState && nodeState.show_viewer_hud === false) {
+                hud.style.display = "none";
+                return;
+            }
+            hud.style.display = "block";
+            const renderInfo = getEffectiveRenderSize();
+            const state = currentPreviewState;
+            if (!state) {
+                hud.textContent = "Waiting for node execution.";
+                return;
+            }
+            hud.innerHTML = `
+                <div><strong>${isCameraLocked() ? "locked" : "scout"}</strong> ${isCameraLocked() ? "params" : "live"}</div>
+                <div>pivot ${fmtFixed(state.pivot_x, 2)} ${fmtFixed(state.pivot_y, 2)} ${fmtFixed(state.pivot_z, 2)}</div>
+                <div>yaw ${fmtFixed(state.yaw_deg, 1)} pitch ${fmtFixed(state.pitch_deg, 1)} roll ${fmtFixed(state.roll_deg, 1)}</div>
+                <div>distance ${fmtFixed(state.distance, 2)} | ${renderInfo.width || 0}x${renderInfo.height || 0}</div>
+                ${serverPreviewDeltaHtml()}
+            `;
+        }
+
+        function postCameraState(commitParameters = false, setManualPivot = false) {
+            if (!uiPayload || !currentPreviewState) {
+                return;
+            }
+            const nodeId = uiPayload.unique_id?.[0];
+            if (!nodeId) {
+                return;
+            }
+            parent.postMessage({
+                type: "GAUSSIAN_SHOT_CAMERA_CHANGED",
+                node_id: nodeId,
+                state: currentPreviewState,
+                commit_parameters: commitParameters,
+                set_manual_pivot: setManualPivot,
+            }, "*");
+        }
+
+        function zoomNorm(distance) {
+            const minZoom = controls?.minZoom ?? 0.1;
+            const maxZoom = controls?.maxZoom ?? 1000;
+            return 0.1 + 0.9 * (distance - minZoom) / Math.max(maxZoom - minZoom, 1e-6);
+        }
+
+        function updateTrackedOrbit(dx, dy) {
+            currentPreviewState.yaw_deg += dx * ORBIT_STEP_RAD * RAD_TO_DEG;
+            currentPreviewState.pitch_deg = clamp(
+                currentPreviewState.pitch_deg - dy * ORBIT_STEP_RAD * RAD_TO_DEG,
+                -89,
+                89
+            );
+        }
+
+        function updateTrackedPan(dx, dy) {
+            const axes = cameraAxes(currentPreviewState.yaw_deg, currentPreviewState.pitch_deg, currentPreviewState.roll_deg);
+            const scale = -0.05 * zoomNorm(currentPreviewState.distance);
+            const px = dx * scale;
+            const py = dy * scale;
+            currentPreviewState.pivot_x += axes.right.x * px + axes.down.x * py;
+            currentPreviewState.pivot_y += axes.right.y * px + axes.down.y * py;
+            currentPreviewState.pivot_z += axes.right.z * px + axes.down.z * py;
+        }
+
+        /** True if the button that started the drag is still reported down on this move event. */
+        function trackedDragButtonStillDown(ev) {
+            if (!pointerTracker) {
+                return false;
+            }
+            const b = pointerTracker.button;
+            if (b === 0) {
+                return (ev.buttons & 1) !== 0;
+            }
+            if (b === 1) {
+                return (ev.buttons & 4) !== 0;
+            }
+            if (b === 2) {
+                return (ev.buttons & 2) !== 0;
+            }
+            return ev.buttons !== 0;
+        }
+
+        /** End scout drag; idempotent. Handles missed mouseup (iframe / capture quirks) via buttons check in mousemove. */
+        function endScoutPointerTracking() {
+            if (!pointerTracker) {
+                return;
+            }
+            const cap = pointerTracker.captureId;
+            const shouldPost = !isCameraLocked();
+            pointerTracker = null;
+            if (cap != null && typeof canvas.releasePointerCapture === "function") {
+                try {
+                    canvas.releasePointerCapture(cap);
+                } catch (_) {
+                    /* already released or not the capture target */
+                }
+            }
+            if (shouldPost) {
+                postCameraState(false, false);
+                if (currentPreviewState) {
+                    applyCameraState(currentPreviewState);
+                }
+                flushMaxGaussiansRecompute();
+                requestRender(18);
+            }
+        }
+
+        function installTrackingHandlers() {
+            /*
+             * gsplat OrbitControls also listens on this canvas and overwrites camera.position every
+             * frame from internal alpha/beta/radius. Our scout math updates currentPreviewState (what
+             * Python rasterizes via interactive_state). Block native pointer handling while scouting
+             * and push each change through applyCameraState so WebGL matches that state.
+             */
+            canvas.addEventListener("mousedown", (event) => {
+                if (isCameraLocked()) {
+                    return;
+                }
+                let captureId = null;
+                if (typeof event.pointerId === "number" && typeof canvas.setPointerCapture === "function") {
+                    try {
+                        canvas.setPointerCapture(event.pointerId);
+                        captureId = event.pointerId;
+                    } catch (_) {
+                        /* passive / unsupported */
+                    }
+                }
+                pointerTracker = {
+                    button: event.button,
+                    shift: event.shiftKey,
+                    x: event.clientX,
+                    y: event.clientY,
+                    captureId,
+                };
+                event.stopImmediatePropagation();
+                requestRender(18);
+            }, true);
+
+            canvas.addEventListener("lostpointercapture", () => {
+                endScoutPointerTracking();
+            });
+
+            canvas.addEventListener("mousemove", (event) => {
+                if (!isCameraLocked() && pointerTracker) {
+                    event.stopImmediatePropagation();
+                }
+            }, true);
+
+            window.addEventListener("mouseup", () => {
+                endScoutPointerTracking();
+            }, true);
+
+            window.addEventListener("pointerup", (event) => {
+                if (!pointerTracker) {
+                    return;
+                }
+                if (pointerTracker.captureId != null && event.pointerId !== pointerTracker.captureId) {
+                    return;
+                }
+                endScoutPointerTracking();
+            }, true);
+
+            window.addEventListener("pointercancel", (event) => {
+                if (!pointerTracker) {
+                    return;
+                }
+                if (pointerTracker.captureId != null && event.pointerId !== pointerTracker.captureId) {
+                    return;
+                }
+                endScoutPointerTracking();
+            }, true);
+
+            window.addEventListener("blur", () => {
+                endScoutPointerTracking();
+            });
+
+            window.addEventListener("mousemove", (event) => {
+                if (!pointerTracker || !currentPreviewState || isCameraLocked()) {
+                    return;
+                }
+                if (!trackedDragButtonStillDown(event)) {
+                    endScoutPointerTracking();
+                    return;
+                }
+                const dx = event.clientX - pointerTracker.x;
+                const dy = event.clientY - pointerTracker.y;
+                pointerTracker.x = event.clientX;
+                pointerTracker.y = event.clientY;
+
+                if (pointerTracker.button === 2 || pointerTracker.shift) {
+                    updateTrackedPan(dx, dy);
+                    postCameraState(false, true);
+                } else {
+                    updateTrackedOrbit(dx, dy);
+                    postCameraState(false, false);
+                }
+
+                applyCameraState(currentPreviewState);
+                updateHud();
+                requestRender(24);
+            }, true);
+
+            canvas.addEventListener("wheel", (event) => {
+                if (!currentPreviewState || isCameraLocked()) {
+                    return;
+                }
+                event.stopImmediatePropagation();
+                currentPreviewState.distance = clamp(
+                    currentPreviewState.distance * Math.exp(event.deltaY * WHEEL_STEP),
+                    controls?.minZoom ?? 0.1,
+                    controls?.maxZoom ?? 1000
+                );
+                applyCameraState(currentPreviewState);
+                postCameraState(false, false);
+                updateHud();
+                requestRender(24);
+            }, { capture: true, passive: true });
+        }
+
+        async function fetchPlyArrayBufferCopy(url) {
+            const res = await fetch(url, {
+                credentials: "same-origin",
+                cache: "no-store",
+            });
+            if (!res.ok) {
+                throw new Error(`PLY fetch ${res.status} ${res.statusText}`);
+            }
+            const raw = await res.arrayBuffer();
+            return raw.slice(0);
+        }
+
+        async function loadPlyBufferIntoScene(arrayBuffer) {
+            const L = SPLAT.PLYLoader;
+            if (typeof L.LoadFromArrayBuffer === "function") {
+                const out = L.LoadFromArrayBuffer(arrayBuffer, scene);
+                if (out && typeof out.then === "function") {
+                    await out;
+                }
+                return;
+            }
+            if (typeof L.LoadFromArrayBufferAsync === "function") {
+                await L.LoadFromArrayBufferAsync(arrayBuffer, scene);
+                return;
+            }
+            const blob = new Blob([arrayBuffer], { type: "application/octet-stream" });
+            const objectUrl = URL.createObjectURL(blob);
+            try {
+                await L.LoadAsync(objectUrl, scene);
+            } finally {
+                URL.revokeObjectURL(objectUrl);
+            }
+        }
+
+        function loadGaussian(url) {
+            if (!scene || !url) {
+                return Promise.resolve();
+            }
+
+            gaussianLoadChain = gaussianLoadChain
+                .then(async () => {
+                    if (url === lastLoadedUrl && currentSplat) {
+                        return;
+                    }
+                    hideError();
+                    requestRender(24);
+
+                    /*
+                     * gsplat WebGLRenderer: each objectRemoved/objectAdded runs resetSplatData()
+                     * (worker terminate + RenderData dispose). Clearing with many removeObject() calls
+                     * overlaps in-flight worker ArrayBuffer transfers → "detached ArrayBuffer".
+                     * Swap to a fresh Scene and render once so ShaderProgram disposes the old pipeline
+                     * and attaches listeners to the new scene before PLYLoader.addObject runs.
+                     */
+                    currentSplat = null;
+                    originalScales = null;
+                    originalColors = null;
+                    lastMaxGaussiansCapSig = "";
+                    scene = new SPLAT.Scene();
+                    syncIntrinsics();
+                    camera.raiseChangeEvent?.();
+                    renderer.render(scene, camera);
+                    await new Promise((r) => requestAnimationFrame(r));
+                    await new Promise((r) => requestAnimationFrame(r));
+                    await new Promise((r) => setTimeout(r, 0));
+
+                    const plyBytes = await fetchPlyArrayBufferCopy(url);
+                    await loadPlyBufferIntoScene(plyBytes);
+                    lastLoadedUrl = url;
+
+                    if (scene.objects?.length) {
+                        currentSplat = scene.objects[scene.objects.length - 1];
+                        if (currentSplat.data?.scales) {
+                            originalScales = new Float32Array(currentSplat.data.scales.length);
+                            for (let i = 0; i < currentSplat.data.scales.length; i++) {
+                                originalScales[i] = currentSplat.data.scales[i];
+                            }
+                        }
+                        if (currentSplat.data?.colors) {
+                            originalColors = new Uint8Array(currentSplat.data.colors.length);
+                            originalColors.set(currentSplat.data.colors);
+                        }
+                    }
+                    applyGaussianScale(nodeState?.gaussian_scale ?? 1.0);
+                    requestRender(24);
+                })
+                .catch((error) => {
+                    lastLoadedUrl = "";
+                    const msg = error && error.message ? error.message : String(error);
+                    showError(`Failed to load PLY: ${msg}`);
+                });
+
+            return gaussianLoadChain;
+        }
+
+        async function handleStateMessage(message) {
+            const wasLocked = lastLockState;
+            uiPayload = message.ui;
+            nodeState = message.state || {};
+            lastLockState = isCameraLocked();
+            setLockOverlay(lastLockState);
+
+            if (!wasLocked && lastLockState && currentPreviewState) {
+                postCameraState(true, true);
+            }
+
+            if (lastLockState) {
+                currentPreviewState = proceduralStateFromUi(nodeState);
+                applyCameraState(currentPreviewState);
+            } else if (!currentPreviewState || wasLocked) {
+                currentPreviewState = interactiveStateFromUi(nodeState);
+                applyCameraState(currentPreviewState);
+            } else {
+                syncIntrinsics();
+                applyGaussianScale(nodeState.gaussian_scale);
+                updateHud();
+                requestRender(18);
+            }
+
+            /* After a Comfy run, preview_camera_state is the exact camera Python rasterized with. */
+            const snap = uiPayload?.preview_camera_state?.[0];
+            if (
+                !isCameraLocked()
+                && typeof snap === "string"
+                && snap
+                && snap !== lastServerPreviewCameraJson
+            ) {
+                lastServerPreviewCameraJson = snap;
+                try {
+                    const o = JSON.parse(snap);
+                    currentPreviewState = {
+                        pivot_x: Number(o.pivot_x) || 0,
+                        pivot_y: Number(o.pivot_y) || 0,
+                        pivot_z: Number(o.pivot_z) || 0,
+                        yaw_deg: Number(o.yaw_deg) || 0,
+                        pitch_deg: Number(o.pitch_deg) || 0,
+                        roll_deg: Number(o.roll_deg) || 0,
+                        distance: (() => {
+                            const d = Number(o.distance);
+                            if (!Number.isFinite(d)) {
+                                return 1e-4;
+                            }
+                            if (Math.abs(d) < 1e-4) {
+                                return d < 0 ? -1e-4 : 1e-4;
+                            }
+                            return d;
+                        })(),
+                    };
+                    const cpx = Number(o.cam_pos_x);
+                    const cpy = Number(o.cam_pos_y);
+                    const cpz = Number(o.cam_pos_z);
+                    if (Number.isFinite(cpx) && Number.isFinite(cpy) && Number.isFinite(cpz)) {
+                        currentPreviewState.cam_pos_x = cpx;
+                        currentPreviewState.cam_pos_y = cpy;
+                        currentPreviewState.cam_pos_z = cpz;
+                    }
+                    for (let i = 0; i < 3; i++) {
+                        for (let j = 0; j < 3; j++) {
+                            const key = `cam_r${i}${j}`;
+                            const v = Number(o[key]);
+                            if (Number.isFinite(v)) {
+                                currentPreviewState[key] = v;
+                            }
+                        }
+                    }
+                    applyCameraState(currentPreviewState);
+                    requestRender(24);
+                } catch (_) {
+                    /* ignore malformed */
+                }
+            }
+
+            /* Load PLY after camera/HUD so the viewer never sits on "Waiting…" if fetch/parse stalls or fails. */
+            if (uiPayload?.file_url) {
+                await loadGaussian(uiPayload.file_url);
+            }
+        }
+
+        window.addEventListener("message", (event) => {
+            const message = event.data;
+            if (!message || message.type !== "GAUSSIAN_SHOT_STATE") {
+                return;
+            }
+            stateHandleChain = stateHandleChain
+                .then(() => handleStateMessage(message))
+                .catch((err) => {
+                    console.error("[GaussianShot viewer] state message failed:", err);
+                });
+        });
+
+        await loadScriptCandidates(GSPLAT_CANDIDATES);
+        SPLAT = window.GSPLAT;
+        if (!SPLAT) {
+            showError("gsplat bundle loaded but GSPLAT is unavailable");
+            throw new Error("GSPLAT missing");
+        }
+
+        scene = new SPLAT.Scene();
+        camera = new SPLAT.Camera();
+        renderer = new SPLAT.WebGLRenderer(canvas);
+        controls = new SPLAT.OrbitControls(camera, canvas);
+        controls.minZoom = 0.05;
+        controls.maxZoom = 1000;
+        controls.dampening = 1;
+
+        /* OrbitControls uses bubble listeners; our capture listeners run first and stop them in scout mode. */
+        installTrackingHandlers();
+        resizePivotCrossOverlay();
+        window.addEventListener("resize", () => {
+            resizePivotCrossOverlay();
+            requestRender(18);
+        });
+
+        /*
+         * gsplat OrbitControls.update() always ends with Quaternion.FromEuler(rx, ry, 0) — roll is dropped.
+         * Locked shot variation can also place the eye off the pivot–camera ray (cam_pos_*). Re-apply each frame.
+         */
+        function finalizeCameraOrientationFromState() {
+            if (!camera || !controls || !currentPreviewState) {
+                return;
+            }
+            const st = currentPreviewState;
+            if (
+                Number.isFinite(st.cam_pos_x)
+                && Number.isFinite(st.cam_pos_y)
+                && Number.isFinite(st.cam_pos_z)
+            ) {
+                camera.position = new SPLAT.Vector3(st.cam_pos_x, st.cam_pos_y, st.cam_pos_z);
+                controls.setCameraTarget(new SPLAT.Vector3(st.pivot_x, st.pivot_y, st.pivot_z));
+            }
+            if (Number.isFinite(st.cam_r00)) {
+                const rwc = [
+                    [st.cam_r00, st.cam_r01, st.cam_r02],
+                    [st.cam_r10, st.cam_r11, st.cam_r12],
+                    [st.cam_r20, st.cam_r21, st.cam_r22],
+                ];
+                const rCol = transpose3(rwc);
+                camera.rotation = SPLAT.Quaternion.FromMatrix3(new SPLAT.Matrix3(
+                    rCol[0][0], rCol[0][1], rCol[0][2],
+                    rCol[1][0], rCol[1][1], rCol[1][2],
+                    rCol[2][0], rCol[2][1], rCol[2][2],
+                ));
+            } else {
+                camera.rotation = SPLAT.Quaternion.FromEuler(new SPLAT.Vector3(
+                    deg2rad(st.pitch_deg),
+                    deg2rad(st.yaw_deg),
+                    deg2rad(st.roll_deg),
+                ));
+            }
+            camera.raiseChangeEvent?.();
+        }
+
+        function animate() {
+            const locked = isCameraLocked();
+            if (needsRender || renderFramesRemaining > 0 || (!locked && pointerTracker)) {
+                syncIntrinsics();
+                /* dampening=1: OrbitControls must not lerp away from applyCameraState (scout + locked). */
+                controls.dampening = 1;
+                controls.update();
+                finalizeCameraOrientationFromState();
+                renderer.render(scene, camera);
+                needsRender = false;
+                renderFramesRemaining = Math.max(renderFramesRemaining - 1, 0);
+            }
+            drawPivotWorldCrosshair();
+            raf = requestAnimationFrame(animate);
+        }
+
+        animate();
+
+        window.addEventListener("beforeunload", () => {
+            if (raf) {
+                cancelAnimationFrame(raf);
+            }
+            controls?.dispose?.();
+        });
+    </script>
+</body>
+</html>
