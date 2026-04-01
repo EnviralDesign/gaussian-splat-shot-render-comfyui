@@ -45,7 +45,7 @@ class LoadSharpModel:
     RETURN_TYPES = ("SHARP_MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_model"
-    CATEGORY = "SHARP"
+    CATEGORY = "Gaussian Splat Shot"
     DESCRIPTION = "Load the SHARP model for monocular 3D Gaussian Splatting prediction."
 
     def load_model(self, precision: str = "auto", checkpoint_path: str = ""):

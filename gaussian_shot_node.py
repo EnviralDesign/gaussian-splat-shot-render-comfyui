@@ -831,7 +831,17 @@ class GaussianShotRenderNode:
                         "tooltip": "Show the interactive viewer info overlay (camera, pivot, resolution).",
                     },
                 ),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        # Frontend: string sets default control mode ("fixed" | "increment" | "decrement" | "randomize").
+                        "control_after_generate": "fixed",
+                        "tooltip": "Locked-shot variation seed. Default control mode is fixed (0); change the dropdown to randomize after each run.",
+                    },
+                ),
                 "rand_tx_min": (
                     "FLOAT",
                     {
@@ -895,7 +905,7 @@ class GaussianShotRenderNode:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     FUNCTION = "render"
-    CATEGORY = "Gaussian"
+    CATEGORY = "Gaussian Splat Shot"
     OUTPUT_NODE = True
 
     def render(

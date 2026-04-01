@@ -193,6 +193,17 @@ app.registerExtension({
                 setValue() {},
             });
 
+            // addDOMWidget appends; move viewer to top of widget stack (below input sockets).
+            const viewerWidget = this.widgets?.find((w) => w.name === "gaussian_shot_viewer");
+            if (viewerWidget && this.widgets) {
+                const i = this.widgets.indexOf(viewerWidget);
+                if (i > 0) {
+                    this.widgets.splice(i, 1);
+                    this.widgets.unshift(viewerWidget);
+                }
+            }
+            this.setDirtyCanvas?.(true, true);
+
             this.gaussianShotIframe = iframe;
             this.gaussianShotUi = null;
             this.gaussianShotLoaded = false;

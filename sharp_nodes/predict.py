@@ -70,7 +70,7 @@ class SharpPredict:
     RETURN_TYPES = ("STRING", "EXTRINSICS", "INTRINSICS",)
     RETURN_NAMES = ("ply_path", "extrinsics", "intrinsics",)
     FUNCTION = "predict"
-    CATEGORY = "SHARP"
+    CATEGORY = "Gaussian Splat Shot"
     OUTPUT_NODE = True
     DESCRIPTION = "Generate 3D Gaussian Splatting PLY file(s) from image(s) using SHARP. Batch input creates a folder with numbered PLY files."
 
