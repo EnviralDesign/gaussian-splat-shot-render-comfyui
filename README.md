@@ -42,9 +42,9 @@ cmd /c mklink /J "D:\ComfyUI\custom_nodes\gaussian-splat-shot-render-comfyui" "C
 ## Performance and memory
 
 - **Why the raster feels slow:** The “capture” path is a **CPU** reference splatter (NumPy, optionally **Numba**-JIT). The inline viewer uses **WebGL** (`gsplat`) on the GPU and only moves splatted fragments—very different work, so realtime preview does not imply a fast final raster.
-- **Speed:** Install **`numba`** (`pip install numba` or use `requirements.txt`). The first run may pause briefly while LLVM compiles the splat kernel; later runs are much faster.
+- **Speed:** Install **`numba`** (`pip install numba` or use `requirements.txt`). The first splat in a Comfy session may pause briefly while LLVM compiles; later runs in the same process stay fast. By default the JIT does **not** use Numba’s on-disk cache, so cloning the same venv or switching between `D:\…` and `C:\…` Comfy trees does not explode with `ModuleNotFoundError` for an old path. To opt into disk cache on a stable machine, set `GAUSSIAN_SHOT_NUMBA_DISK_CACHE=1`.
 - **VRAM after a run:** This node does **not** run the splat raster on CUDA. Any **GPU** memory you still see is almost always **SHARP / other models**, **ComfyUI’s graph / preview cache** (it may place `IMAGE` tensors on the GPU), or the **browser** WebGL tab—not the PLY decode itself. **System RAM:** one decoded PLY is cached (path + mtime) so repeat runs skip disk parse; that cache can be large on big clouds.
-- **Optional env:** `GAUSSIAN_SHOT_DISABLE_PLY_CACHE=1` — no in-process PLY decode cache (more I/O and CPU on every run, lower steady RAM). `GAUSSIAN_SHOT_DISABLE_NUMBA=1` — force the slow pure-Python splat loop (debug only).
+- **Optional env:** `GAUSSIAN_SHOT_DISABLE_PLY_CACHE=1` — no in-process PLY decode cache (more I/O and CPU on every run, lower steady RAM). `GAUSSIAN_SHOT_DISABLE_NUMBA=1` — force the slow pure-Python splat loop (debug only). `GAUSSIAN_SHOT_NUMBA_DISK_CACHE=1` — enable Numba disk cache (faster first splat after restart if your install path is stable).
 
 ## License
 

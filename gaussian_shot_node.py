@@ -17,6 +17,9 @@ except Exception:
 
 _DISABLE_PLY_CACHE = os.environ.get("GAUSSIAN_SHOT_DISABLE_PLY_CACHE", "").strip().lower() in ("1", "true", "yes")
 _DISABLE_NUMBA = os.environ.get("GAUSSIAN_SHOT_DISABLE_NUMBA", "").strip().lower() in ("1", "true", "yes")
+# Disk cache binds to how/where Comfy loaded the module; another install path can break unpickle
+# (ModuleNotFoundError for the old custom_nodes path). In-process compile is enough per Comfy run.
+_NUMBA_DISK_CACHE = os.environ.get("GAUSSIAN_SHOT_NUMBA_DISK_CACHE", "").strip().lower() in ("1", "true", "yes")
 
 _PLY_CACHE: dict[tuple[str, float], dict[str, np.ndarray]] = {}
 
@@ -25,7 +28,7 @@ try:
         raise ImportError("numba disabled via GAUSSIAN_SHOT_DISABLE_NUMBA")
     from numba import njit
 
-    @njit(cache=True, fastmath=True)
+    @njit(cache=_NUMBA_DISK_CACHE, fastmath=True)
     def _accumulate_splats_numba(
         image: np.ndarray,
         u: np.ndarray,
