@@ -377,6 +377,14 @@ def _fit_distance_for_radius(radius: float, intrinsics: np.ndarray | None) -> fl
     return radius * 3.5
 
 
+def _background_fill_value(background: str) -> float:
+    if background == "white":
+        return 1.0
+    if background == "mid-gray":
+        return 0.5
+    return 0.0
+
+
 def _build_framed_state(auto_pivot: np.ndarray, xyz: np.ndarray, intrinsics: np.ndarray | None) -> dict[str, float]:
     radius = _scene_radius_from_xyz(xyz)
     distance = _fit_distance_for_radius(radius, intrinsics)
@@ -678,8 +686,7 @@ def _render_gaussians(
     visible = z > 1e-3
     if not np.any(visible):
         bg = np.zeros((height, width, 3), dtype=np.float32)
-        if background == "white":
-            bg.fill(1.0)
+        bg.fill(_background_fill_value(background))
         return bg
 
     cam_xyz = cam_xyz[visible]
@@ -721,8 +728,7 @@ def _render_gaussians(
     )
     if not np.any(in_frame):
         bg = np.zeros((height, width, 3), dtype=np.float32)
-        if background == "white":
-            bg.fill(1.0)
+        bg.fill(_background_fill_value(background))
         return bg
 
     u = u[in_frame]
@@ -753,8 +759,7 @@ def _render_gaussians(
     radius = radius[order]
 
     image = np.zeros((height, width, 3), dtype=np.float32)
-    if background == "white":
-        image.fill(1.0)
+    image.fill(_background_fill_value(background))
 
     if _HAS_NUMBA_SPLATS and _accumulate_splats_numba is not None:
         _accumulate_splats_numba(
@@ -910,7 +915,7 @@ class GaussianShotRenderNode:
                     "INT",
                     {"default": 0, "min": 0, "max": 200000, "step": 1000, "tooltip": "0 = no cap (all in-frustum splats). >0 keeps top-N by importance."},
                 ),
-                "background": (["black", "white"], {"default": "black"}),
+                "background": (["black", "mid-gray", "white"], {"default": "black"}),
             },
             "optional": {
                 "ply_path": ("STRING", {"forceInput": True, "tooltip": "Path to a Gaussian Splatting PLY file"}),
