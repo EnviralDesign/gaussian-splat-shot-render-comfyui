@@ -905,7 +905,6 @@
             const droll = randInRange(seed, 6, Number(state.rand_roll_min), Number(state.rand_roll_max));
             const lpitch = randInRange(seed, 7, Number(state.rand_loc_pitch_min), Number(state.rand_loc_pitch_max));
             const lyaw = randInRange(seed, 8, Number(state.rand_loc_yaw_min), Number(state.rand_loc_yaw_max));
-            const lroll = randInRange(seed, 9, Number(state.rand_loc_roll_min), Number(state.rand_loc_roll_max));
 
             const procIdle = (
                 Math.abs(dx) < 1e-8 && Math.abs(dy) < 1e-8 && Math.abs(dz) < 1e-8
@@ -945,7 +944,7 @@
             const rMid = matMul3(rWorldDelta, rBase);
             const rLoc = eulerDegToMatrix(lpitch, lyaw, 0);
             const rOrbit = matMul3(rMid, rLoc);
-            const rFinal = applyRollToBasisMatrix(rOrbit, br + droll + lroll);
+            const rFinal = applyRollToBasisMatrix(rOrbit, br + droll);
 
             const fwd = normalize3(matVec3(rOrbit, [0, 0, 1]));
             const orbitPos = {

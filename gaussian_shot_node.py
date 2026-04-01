@@ -461,14 +461,13 @@ def _apply_shot_variation(
     rand_loc_pitch_max: float,
     rand_loc_yaw_min: float,
     rand_loc_yaw_max: float,
-    rand_loc_roll_min: float,
-    rand_loc_roll_max: float,
 ) -> dict[str, float]:
     """
     Locked-shot variation order (matches viewer):
     1) R_w = R_delta_world @ R_base with the same Rz·Ry·Rx(pitch,yaw,rolldeg) convention as the panel.
-    2) R = R_w @ R_loc (camera-local jitter triple, same inner convention).
-    3) Place on pivot orbit: position = pivot - forward(R)·distance, then add pure world XYZ translation.
+    2) R = R_w @ R_loc using only camera-local yaw/pitch jitter.
+    3) Apply the single downstream roll jitter from rand_roll.
+    4) Place on pivot orbit: position = pivot - forward(R_orbit)·distance, then add pure world XYZ translation.
     Stored yaw/pitch/roll are recovered from R for HUD; explicit cam_pos_* always set when non-idle.
     """
     dx = _rand_in_range(seed, 1, rand_tx_min, rand_tx_max)
@@ -479,7 +478,6 @@ def _apply_shot_variation(
     droll = _rand_in_range(seed, 6, rand_roll_min, rand_roll_max)
     lpitch = _rand_in_range(seed, 7, rand_loc_pitch_min, rand_loc_pitch_max)
     lyaw = _rand_in_range(seed, 8, rand_loc_yaw_min, rand_loc_yaw_max)
-    lroll = _rand_in_range(seed, 9, rand_loc_roll_min, rand_loc_roll_max)
 
     base_yaw = float(base_state["yaw_deg"])
     base_pitch = float(base_state["pitch_deg"])
@@ -495,7 +493,6 @@ def _apply_shot_variation(
         and abs(droll) < 1e-8
         and abs(lpitch) < 1e-8
         and abs(lyaw) < 1e-8
-        and abs(lroll) < 1e-8
     )
     if idle:
         out = dict(base_state)
@@ -511,7 +508,7 @@ def _apply_shot_variation(
     r_mid = _mat_mul_3(r_world_delta, r_base)
     r_loc = _orbit_basis_from_yp(lyaw, lpitch)
     r_orbit = _mat_mul_3(r_mid, r_loc)
-    r_final = _apply_roll_to_basis(r_orbit, base_roll + droll + lroll)
+    r_final = _apply_roll_to_basis(r_orbit, base_roll + droll)
 
     forward = (r_orbit @ np.array([0.0, 0.0, 1.0], dtype=np.float64)).astype(np.float32)
     fn = float(np.linalg.norm(forward))
@@ -861,9 +858,8 @@ class GaussianShotRenderNode:
                         "default": 0,
                         "min": 0,
                         "max": 0xFFFFFFFFFFFFFFFF,
-                        # Frontend: string sets default control mode ("fixed" | "increment" | "decrement" | "randomize").
-                        "control_after_generate": "fixed",
-                        "tooltip": "Locked-shot variation seed. Default control mode is fixed (0); change the dropdown to randomize after each run.",
+                        "control_after_generate": True,
+                        "tooltip": "Locked-shot variation seed.",
                     },
                 ),
                 "rand_tx_min": (
@@ -894,7 +890,7 @@ class GaussianShotRenderNode:
                 "rand_yaw_max": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
                 "rand_pitch_min": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
                 "rand_pitch_max": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
-                "rand_roll_min": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
+                "rand_roll_min": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01, "tooltip": "Final downstream roll jitter (deg)."}),
                 "rand_roll_max": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
                 "rand_loc_pitch_min": (
                     "FLOAT",
@@ -909,8 +905,6 @@ class GaussianShotRenderNode:
                 "rand_loc_pitch_max": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
                 "rand_loc_yaw_min": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
                 "rand_loc_yaw_max": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
-                "rand_loc_roll_min": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
-                "rand_loc_roll_max": ("FLOAT", {"default": 0.0, "min": -1.0e6, "max": 1.0e6, "step": 0.01}),
                 "gaussian_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 64.0, "step": 0.1}),
                 "max_gaussians": (
                     "INT",
@@ -964,8 +958,6 @@ class GaussianShotRenderNode:
         rand_loc_pitch_max: float,
         rand_loc_yaw_min: float,
         rand_loc_yaw_max: float,
-        rand_loc_roll_min: float,
-        rand_loc_roll_max: float,
         gaussian_scale: float,
         max_gaussians: int,
         background: str,
@@ -1037,8 +1029,6 @@ class GaussianShotRenderNode:
             rand_loc_pitch_max=rand_loc_pitch_max,
             rand_loc_yaw_min=rand_loc_yaw_min,
             rand_loc_yaw_max=rand_loc_yaw_max,
-            rand_loc_roll_min=rand_loc_roll_min,
-            rand_loc_roll_max=rand_loc_roll_max,
         )
 
         active_state = dict(output_state if camera_locked else preview_state)
