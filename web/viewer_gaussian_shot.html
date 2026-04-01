@@ -128,7 +128,11 @@
         const errorEl = document.getElementById("error");
         const lockOverlay = document.getElementById("lockOverlay");
 
+        // Prefer this extension's vendored bundle (path follows this HTML file under web/).
+        const _localGsplat = new URL("js/gsplat-bundle.js", new URL(".", import.meta.url)).href;
         const GSPLAT_CANDIDATES = [
+            _localGsplat,
+            // Legacy fallbacks if another extension still serves the same bundle
             "/extensions/ComfyUI-GeometryPack/js/gsplat-bundle.js",
             "/extensions/comfyui-geometrypack/js/gsplat-bundle.js",
         ];

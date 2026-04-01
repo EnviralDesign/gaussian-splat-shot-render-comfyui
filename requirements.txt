@@ -1,5 +1,6 @@
 # ComfyUI already ships torch; listed for local tooling / minimal installs.
 numpy>=1.22
 plyfile>=0.7.4
+huggingface-hub>=0.23.0
 # Strongly recommended: speeds up CPU raster a lot (first run compiles a small cache on disk).
 numba>=0.58.0

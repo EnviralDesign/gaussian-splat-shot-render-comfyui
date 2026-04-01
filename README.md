@@ -11,15 +11,20 @@ Custom node for composing camera shots over 3D Gaussian splatting (PLY), with an
    git clone <your-remote-url> gaussian-splat-shot-render-comfyui
    ```
 
-2. Install Python extras used by the node (if your environment does not already have them):
+2. Install Python extras used by the nodes (if your environment does not already have them):
 
    ```bash
    pip install -r gaussian-splat-shot-render-comfyui/requirements.txt
    ```
 
-3. **Required:** Install **ComfyUI-GeometryPack** (or another extension that serves `gsplat-bundle.js` at `/extensions/ComfyUI-GeometryPack/js/gsplat-bundle.js`). The viewer tries a lowercase path as well for differently cased installs.
+3. Restart ComfyUI and refresh the browser.
 
-4. Restart ComfyUI and refresh the browser.
+This pack is **self-contained** for the combined workflow:
+
+- **Load SHARP Model** / **SHARP Predict (Image to PLY)** — monocular Gaussian prediction (checkpoint loads from Hugging Face unless you pass a local path).
+- **Gaussian Splat Shot Render** — aligned WebGL scout + CPU raster from the PLY + SHARP camera metadata.
+
+The WebGL viewer uses **`web/js/gsplat-bundle.js`** shipped inside this repository (no ComfyUI-GeometryPack install required). Legacy GeometryPack URLs remain as a fallback in `viewer_gaussian_shot.html` only.
 
 ## Developing against a local ComfyUI tree
 
@@ -36,8 +41,10 @@ cmd /c mklink /J "D:\ComfyUI\custom_nodes\gaussian-splat-shot-render-comfyui" "C
 |------|------|
 | `__init__.py` | ComfyUI node registration and `WEB_DIRECTORY` |
 | `gaussian_shot_node.py` | `GaussianShotRender` node, raster, camera / variation math |
+| `sharp_nodes/` | `LoadSharpModel`, `SharpPredict`, vendored Apple `sharp/` core |
 | `web/gaussian_shot.js` | Frontend: iframe viewer, widget sync, execution hooks |
 | `web/viewer_gaussian_shot.html` | WebGL viewer (gsplat) and HUD |
+| `web/js/gsplat-bundle.js` | Vendored WebGL splat bundle (from `comfy-3d-viewers`, GPL-3.0-or-later) |
 
 ## Performance and memory
 
@@ -48,4 +55,5 @@ cmd /c mklink /J "D:\ComfyUI\custom_nodes\gaussian-splat-shot-render-comfyui" "C
 
 ## License
 
-Add a `LICENSE` file when you publish this repository.
+See **`LICENSE`** (MIT for original project code) and **`THIRD_PARTY_NOTICES.md`**
+(Apple SHARP, GPL-3.0 wrapper nodes, bundled `gsplat-bundle.js`, HF Hub, model weights).
