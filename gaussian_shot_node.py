@@ -15,8 +15,95 @@ try:
 except Exception:
     COMFYUI_OUTPUT_FOLDER = None
 
+_DISABLE_PLY_CACHE = os.environ.get("GAUSSIAN_SHOT_DISABLE_PLY_CACHE", "").strip().lower() in ("1", "true", "yes")
+_DISABLE_NUMBA = os.environ.get("GAUSSIAN_SHOT_DISABLE_NUMBA", "").strip().lower() in ("1", "true", "yes")
 
 _PLY_CACHE: dict[tuple[str, float], dict[str, np.ndarray]] = {}
+
+try:
+    if _DISABLE_NUMBA:
+        raise ImportError("numba disabled via GAUSSIAN_SHOT_DISABLE_NUMBA")
+    from numba import njit
+
+    @njit(cache=True, fastmath=True)
+    def _accumulate_splats_numba(
+        image: np.ndarray,
+        u: np.ndarray,
+        v: np.ndarray,
+        colors: np.ndarray,
+        opacities: np.ndarray,
+        sigma2: np.ndarray,
+        radius: np.ndarray,
+        width: int,
+        height: int,
+    ) -> None:
+        """In-place splat raster (same math as meshgrid path; compiled for speed)."""
+        n = u.shape[0]
+        for idx in range(n):
+            r = int(math.ceil(float(radius[idx])))
+            ui = float(u[idx])
+            vi = float(v[idx])
+            x0 = max(0, int(math.floor(ui - float(r))))
+            x1 = min(width, int(math.ceil(ui + float(r) + 1.0)))
+            y0 = max(0, int(math.floor(vi - float(r))))
+            y1 = min(height, int(math.ceil(vi + float(r) + 1.0)))
+            if x0 >= x1 or y0 >= y1:
+                continue
+
+            c00 = float(sigma2[idx, 0, 0])
+            c01 = float(sigma2[idx, 0, 1])
+            c10 = float(sigma2[idx, 1, 0])
+            c11 = float(sigma2[idx, 1, 1])
+            det2 = c00 * c11 - c01 * c10
+            if det2 <= 1e-12:
+                continue
+            idet = 1.0 / det2
+            inv00 = c11 * idet
+            inv01 = -c01 * idet
+            inv10 = -c10 * idet
+            inv11 = c00 * idet
+            inv_cross = inv01 + inv10
+
+            opac = float(opacities[idx])
+            cr = float(colors[idx, 0])
+            cg = float(colors[idx, 1])
+            cb = float(colors[idx, 2])
+
+            max_al = 0.0
+            for yy in range(y0, y1):
+                dys = float(yy) - vi
+                for xx in range(x0, x1):
+                    dxs = float(xx) - ui
+                    q = inv00 * dxs * dxs + inv_cross * dxs * dys + inv11 * dys * dys
+                    al = opac * math.exp(-0.5 * q)
+                    if al > 1.0:
+                        al = 1.0
+                    elif al < 0.0:
+                        al = 0.0
+                    if al > max_al:
+                        max_al = al
+            if max_al < 1e-4:
+                continue
+
+            for yy in range(y0, y1):
+                dys = float(yy) - vi
+                for xx in range(x0, x1):
+                    dxs = float(xx) - ui
+                    q = inv00 * dxs * dxs + inv_cross * dxs * dys + inv11 * dys * dys
+                    al = opac * math.exp(-0.5 * q)
+                    if al > 1.0:
+                        al = 1.0
+                    elif al < 0.0:
+                        al = 0.0
+                    om = 1.0 - al
+                    image[yy, xx, 0] = image[yy, xx, 0] * om + cr * al
+                    image[yy, xx, 1] = image[yy, xx, 1] * om + cg * al
+                    image[yy, xx, 2] = image[yy, xx, 2] * om + cb * al
+
+    _HAS_NUMBA_SPLATS = True
+except ImportError:
+    _accumulate_splats_numba = None  # type: ignore[misc, assignment]
+    _HAS_NUMBA_SPLATS = False
 
 
 def _decode_sh_to_rgb(sh0: np.ndarray) -> np.ndarray:
@@ -471,9 +558,10 @@ def _resolve_intrinsics(
 def _load_gaussian_ply(ply_path: str) -> dict[str, np.ndarray]:
     path = Path(ply_path)
     cache_key = (str(path), path.stat().st_mtime)
-    cached = _PLY_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    if not _DISABLE_PLY_CACHE:
+        cached = _PLY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
     plydata = PlyData.read(path)
     vertices = next(element for element in plydata.elements if element.name == "vertex")
@@ -530,8 +618,9 @@ def _load_gaussian_ply(ply_path: str) -> dict[str, np.ndarray]:
         "opacities": opacities,
         "covariances": covariances,
     }
-    _PLY_CACHE.clear()
-    _PLY_CACHE[cache_key] = result
+    if not _DISABLE_PLY_CACHE:
+        _PLY_CACHE.clear()
+        _PLY_CACHE[cache_key] = result
     return result
 
 
@@ -547,8 +636,9 @@ def _render_gaussians(
     gaussian_scale: float,
     max_gaussians: int,
     background: str,
+    ply_data: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
-    data = _load_gaussian_ply(ply_path)
+    data = ply_data if ply_data is not None else _load_gaussian_ply(ply_path)
     xyz = data["xyz"]
     colors = data["colors"]
     opacities = data["opacities"]
@@ -642,33 +732,46 @@ def _render_gaussians(
     if background == "white":
         image.fill(1.0)
 
-    for idx in range(u.shape[0]):
-        r = int(math.ceil(float(radius[idx])))
-        x0 = max(0, int(math.floor(float(u[idx]) - r)))
-        x1 = min(width, int(math.ceil(float(u[idx]) + r + 1)))
-        y0 = max(0, int(math.floor(float(v[idx]) - r)))
-        y1 = min(height, int(math.ceil(float(v[idx]) + r + 1)))
-        if x0 >= x1 or y0 >= y1:
-            continue
+    if _HAS_NUMBA_SPLATS and _accumulate_splats_numba is not None:
+        _accumulate_splats_numba(
+            image,
+            np.ascontiguousarray(u),
+            np.ascontiguousarray(v),
+            np.ascontiguousarray(colors),
+            np.ascontiguousarray(opacities),
+            np.ascontiguousarray(sigma2),
+            np.ascontiguousarray(radius),
+            width,
+            height,
+        )
+    else:
+        for idx in range(u.shape[0]):
+            r = int(math.ceil(float(radius[idx])))
+            x0 = max(0, int(math.floor(float(u[idx]) - r)))
+            x1 = min(width, int(math.ceil(float(u[idx]) + r + 1)))
+            y0 = max(0, int(math.floor(float(v[idx]) - r)))
+            y1 = min(height, int(math.ceil(float(v[idx]) + r + 1)))
+            if x0 >= x1 or y0 >= y1:
+                continue
 
-        cov = sigma2[idx]
-        det2 = float(cov[0, 0] * cov[1, 1] - cov[0, 1] * cov[1, 0])
-        if det2 <= 1e-12:
-            continue
-        inv = np.array([[cov[1, 1], -cov[0, 1]], [-cov[1, 0], cov[0, 0]]], dtype=np.float32) / det2
+            cov = sigma2[idx]
+            det2 = float(cov[0, 0] * cov[1, 1] - cov[0, 1] * cov[1, 0])
+            if det2 <= 1e-12:
+                continue
+            inv = np.array([[cov[1, 1], -cov[0, 1]], [-cov[1, 0], cov[0, 0]]], dtype=np.float32) / det2
 
-        xs = np.arange(x0, x1, dtype=np.float32) - float(u[idx])
-        ys = np.arange(y0, y1, dtype=np.float32) - float(v[idx])
-        dx, dy = np.meshgrid(xs, ys)
-        quad = inv[0, 0] * dx * dx + (inv[0, 1] + inv[1, 0]) * dx * dy + inv[1, 1] * dy * dy
-        alpha = float(opacities[idx]) * np.exp(-0.5 * quad)
-        alpha = np.clip(alpha, 0.0, 1.0)
-        if float(alpha.max()) < 1e-4:
-            continue
+            xs = np.arange(x0, x1, dtype=np.float32) - float(u[idx])
+            ys = np.arange(y0, y1, dtype=np.float32) - float(v[idx])
+            dx, dy = np.meshgrid(xs, ys)
+            quad = inv[0, 0] * dx * dx + (inv[0, 1] + inv[1, 0]) * dx * dy + inv[1, 1] * dy * dy
+            alpha = float(opacities[idx]) * np.exp(-0.5 * quad)
+            alpha = np.clip(alpha, 0.0, 1.0)
+            if float(alpha.max()) < 1e-4:
+                continue
 
-        patch = image[y0:y1, x0:x1]
-        patch *= 1.0 - alpha[..., None]
-        patch += colors[idx][None, None, :] * alpha[..., None]
+            patch = image[y0:y1, x0:x1]
+            patch *= 1.0 - alpha[..., None]
+            patch += colors[idx][None, None, :] * alpha[..., None]
 
     return np.clip(image, 0.0, 1.0)
 
@@ -922,6 +1025,7 @@ class GaussianShotRenderNode:
             gaussian_scale=gaussian_scale,
             max_gaussians=max_gaussians,
             background=background,
+            ply_data=ply_data,
         )
         image = torch.from_numpy(image.astype(np.float32)[None, ...])
 
