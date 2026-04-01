@@ -395,8 +395,44 @@
             return matMul3(matMul3(rzm, rym), rxm);
         }
 
+        function orbitAxes(yawDeg, pitchDeg) {
+            const m = eulerDegToMatrix(pitchDeg, yawDeg, 0);
+            const r = matVec3(m, [1, 0, 0]);
+            const d = matVec3(m, [0, 1, 0]);
+            const f = matVec3(m, [0, 0, 1]);
+            return {
+                right: { x: r[0], y: r[1], z: r[2] },
+                down: { x: d[0], y: d[1], z: d[2] },
+                forward: { x: f[0], y: f[1], z: f[2] },
+            };
+        }
+
+        function applyRollToBasisMatrix(basis, rollDeg) {
+            const az = deg2rad(rollDeg);
+            const cr = Math.cos(az);
+            const sr = Math.sin(az);
+            const refRight = matVec3(basis, [1, 0, 0]);
+            const refDown = matVec3(basis, [0, 1, 0]);
+            const forward = matVec3(basis, [0, 0, 1]);
+            const right = [
+                refRight[0] * cr + refDown[0] * sr,
+                refRight[1] * cr + refDown[1] * sr,
+                refRight[2] * cr + refDown[2] * sr,
+            ];
+            const down = [
+                refDown[0] * cr - refRight[0] * sr,
+                refDown[1] * cr - refRight[1] * sr,
+                refDown[2] * cr - refRight[2] * sr,
+            ];
+            return [
+                [right[0], down[0], forward[0]],
+                [right[1], down[1], forward[1]],
+                [right[2], down[2], forward[2]],
+            ];
+        }
+
         function cameraAxes(yawDeg, pitchDeg, rollDeg) {
-            const m = eulerDegToMatrix(pitchDeg, yawDeg, rollDeg);
+            const m = applyRollToBasisMatrix(eulerDegToMatrix(pitchDeg, yawDeg, 0), rollDeg);
             const r = matVec3(m, [1, 0, 0]);
             const d = matVec3(m, [0, 1, 0]);
             const f = matVec3(m, [0, 0, 1]);
@@ -417,7 +453,7 @@
             ) {
                 position = new SPLAT.Vector3(state.cam_pos_x, state.cam_pos_y, state.cam_pos_z);
             } else {
-                const { forward } = cameraAxes(state.yaw_deg, state.pitch_deg, state.roll_deg);
+                const { forward } = orbitAxes(state.yaw_deg, state.pitch_deg);
                 position = new SPLAT.Vector3(
                     pivot.x - forward.x * state.distance,
                     pivot.y - forward.y * state.distance,
@@ -904,13 +940,14 @@
             const bp = Number(base.pitch_deg);
             const br = Number.isFinite(Number(base.roll_deg)) ? Number(base.roll_deg) : 0;
 
-            const rBase = eulerDegToMatrix(bp, by, br);
-            const rWorldDelta = eulerDegToMatrix(dpitch, dyaw, droll);
+            const rBase = eulerDegToMatrix(bp, by, 0);
+            const rWorldDelta = eulerDegToMatrix(dpitch, dyaw, 0);
             const rMid = matMul3(rWorldDelta, rBase);
-            const rLoc = eulerDegToMatrix(lpitch, lyaw, lroll);
-            const rFinal = matMul3(rMid, rLoc);
+            const rLoc = eulerDegToMatrix(lpitch, lyaw, 0);
+            const rOrbit = matMul3(rMid, rLoc);
+            const rFinal = applyRollToBasisMatrix(rOrbit, br + droll + lroll);
 
-            const fwd = normalize3(matVec3(rFinal, [0, 0, 1]));
+            const fwd = normalize3(matVec3(rOrbit, [0, 0, 1]));
             const orbitPos = {
                 x: pivotVec.x - fwd[0] * baseD,
                 y: pivotVec.y - fwd[1] * baseD,
@@ -1077,6 +1114,10 @@
             currentPreviewState.pivot_z += axes.right.z * px + axes.down.z * py;
         }
 
+        function updateTrackedRoll(dx) {
+            currentPreviewState.roll_deg += dx * ORBIT_STEP_RAD * RAD_TO_DEG;
+        }
+
         /** True if the button that started the drag is still reported down on this move event. */
         function trackedDragButtonStillDown(ev) {
             if (!pointerTracker) {
@@ -1131,6 +1172,9 @@
                 if (isCameraLocked()) {
                     return;
                 }
+                if (event.button === 1) {
+                    event.preventDefault();
+                }
                 let captureId = null;
                 if (typeof event.pointerId === "number" && typeof canvas.setPointerCapture === "function") {
                     try {
@@ -1157,6 +1201,13 @@
 
             canvas.addEventListener("mousemove", (event) => {
                 if (!isCameraLocked() && pointerTracker) {
+                    event.stopImmediatePropagation();
+                }
+            }, true);
+
+            canvas.addEventListener("auxclick", (event) => {
+                if (!isCameraLocked() && event.button === 1) {
+                    event.preventDefault();
                     event.stopImmediatePropagation();
                 }
             }, true);
@@ -1205,6 +1256,9 @@
                 if (pointerTracker.button === 2 || pointerTracker.shift) {
                     updateTrackedPan(dx, dy);
                     postCameraState(false, true);
+                } else if (pointerTracker.button === 1) {
+                    updateTrackedRoll(dx);
+                    postCameraState(false, false);
                 } else {
                     updateTrackedOrbit(dx, dy);
                     postCameraState(false, false);
@@ -1475,10 +1529,21 @@
                     rCol[2][0], rCol[2][1], rCol[2][2],
                 ));
             } else {
-                camera.rotation = SPLAT.Quaternion.FromEuler(new SPLAT.Vector3(
-                    deg2rad(st.pitch_deg),
-                    deg2rad(st.yaw_deg),
-                    deg2rad(st.roll_deg),
+                const ax = cameraAxes(
+                    Number(st.yaw_deg) || 0,
+                    Number(st.pitch_deg) || 0,
+                    Number(st.roll_deg) || 0,
+                );
+                const rwc = [
+                    [ax.right.x, ax.right.y, ax.right.z],
+                    [ax.down.x, ax.down.y, ax.down.z],
+                    [ax.forward.x, ax.forward.y, ax.forward.z],
+                ];
+                const rCol = transpose3(rwc);
+                camera.rotation = SPLAT.Quaternion.FromMatrix3(new SPLAT.Matrix3(
+                    rCol[0][0], rCol[0][1], rCol[0][2],
+                    rCol[1][0], rCol[1][1], rCol[1][2],
+                    rCol[2][0], rCol[2][1], rCol[2][2],
                 ));
             }
             camera.raiseChangeEvent?.();

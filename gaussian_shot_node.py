@@ -174,6 +174,28 @@ def _euler_deg_to_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
     return (rzm @ rym @ rxm).astype(np.float32)
 
 
+def _orbit_basis_from_yp(yaw_deg: float, pitch_deg: float) -> np.ndarray:
+    return _euler_deg_to_matrix(pitch_deg, yaw_deg, 0.0)
+
+
+def _apply_roll_to_basis(basis: np.ndarray, roll_deg: float) -> np.ndarray:
+    roll_rad = math.radians(roll_deg)
+    cr, sr = math.cos(roll_rad), math.sin(roll_rad)
+    ref_right = (basis @ np.array([1.0, 0.0, 0.0], dtype=np.float32)).astype(np.float32)
+    ref_down = (basis @ np.array([0.0, 1.0, 0.0], dtype=np.float32)).astype(np.float32)
+    forward = (basis @ np.array([0.0, 0.0, 1.0], dtype=np.float32)).astype(np.float32)
+    right = (ref_right * cr + ref_down * sr).astype(np.float32)
+    down = (ref_down * cr - ref_right * sr).astype(np.float32)
+    return np.array(
+        [
+            [right[0], down[0], forward[0]],
+            [right[1], down[1], forward[1]],
+            [right[2], down[2], forward[2]],
+        ],
+        dtype=np.float32,
+    )
+
+
 def _hash_unit(seed: int, stream: int) -> float:
     x = (int(seed) & 0xFFFFFFFF) ^ ((stream * 0x9E3779B9) & 0xFFFFFFFF)
     x ^= x >> 16
@@ -270,7 +292,7 @@ def _rotation_matrix_to_ypr_deg(rot: np.ndarray) -> tuple[float, float, float]:
 
 
 def _camera_axes(yaw_deg: float, pitch_deg: float, roll_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    rot = _euler_deg_to_matrix(pitch_deg, yaw_deg, roll_deg)
+    rot = _apply_roll_to_basis(_orbit_basis_from_yp(yaw_deg, pitch_deg), roll_deg)
     right = rot @ np.array([1.0, 0.0, 0.0], dtype=np.float32)
     down = rot @ np.array([0.0, 1.0, 0.0], dtype=np.float32)
     forward = rot @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
@@ -308,7 +330,8 @@ def _state_to_camera(state: dict[str, float]) -> dict[str, Any]:
     if cx is not None and cy is not None and cz is not None:
         position = np.array([float(cx), float(cy), float(cz)], dtype=np.float32)
     else:
-        _, _, forward = _camera_axes(state["yaw_deg"], state["pitch_deg"], state["roll_deg"])
+        orbit_basis = _orbit_basis_from_yp(state["yaw_deg"], state["pitch_deg"])
+        forward = (orbit_basis @ np.array([0.0, 0.0, 1.0], dtype=np.float32)).astype(np.float32)
         position = (pivot - forward * float(state["distance"])).astype(np.float32)
     return {
         "position": position,
@@ -483,13 +506,14 @@ def _apply_shot_variation(
                 out.pop(f"cam_r{i}{j}", None)
         return out
 
-    r_base = _euler_deg_to_matrix(base_pitch, base_yaw, base_roll)
-    r_world_delta = _euler_deg_to_matrix(dpitch, dyaw, droll)
+    r_base = _orbit_basis_from_yp(base_yaw, base_pitch)
+    r_world_delta = _orbit_basis_from_yp(dyaw, dpitch)
     r_mid = _mat_mul_3(r_world_delta, r_base)
-    r_loc = _euler_deg_to_matrix(lpitch, lyaw, lroll)
-    r_final = _mat_mul_3(r_mid, r_loc)
+    r_loc = _orbit_basis_from_yp(lyaw, lpitch)
+    r_orbit = _mat_mul_3(r_mid, r_loc)
+    r_final = _apply_roll_to_basis(r_orbit, base_roll + droll + lroll)
 
-    forward = (r_final @ np.array([0.0, 0.0, 1.0], dtype=np.float64)).astype(np.float32)
+    forward = (r_orbit @ np.array([0.0, 0.0, 1.0], dtype=np.float64)).astype(np.float32)
     fn = float(np.linalg.norm(forward))
     if fn < 1e-10:
         forward = np.array([0.0, 0.0, 1.0], dtype=np.float32)
