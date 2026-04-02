@@ -161,6 +161,10 @@
         let lastLockState = false;
         /** When server returns a new preview_camera_state JSON, re-snap viewport to raster truth. */
         let lastServerPreviewCameraJson = "";
+        /** Locked runs rasterize output_state; snap only when the server returns a fresh locked raster state. */
+        let lastServerRasterCameraJson = "";
+        /** Preserve exact locked raster view until a relevant widget value changes locally. */
+        let lastLockedRasterStateSignature = "";
         let raf = null;
         let needsRender = true;
         let renderFramesRemaining = 0;
@@ -846,6 +850,53 @@
             };
         }
 
+        function parseServerCameraState(raw) {
+            if (typeof raw !== "string" || !raw) {
+                return null;
+            }
+            try {
+                const o = JSON.parse(raw);
+                const out = {
+                    pivot_x: Number(o.pivot_x) || 0,
+                    pivot_y: Number(o.pivot_y) || 0,
+                    pivot_z: Number(o.pivot_z) || 0,
+                    yaw_deg: Number(o.yaw_deg) || 0,
+                    pitch_deg: Number(o.pitch_deg) || 0,
+                    roll_deg: Number(o.roll_deg) || 0,
+                    distance: (() => {
+                        const d = Number(o.distance);
+                        if (!Number.isFinite(d)) {
+                            return 1e-4;
+                        }
+                        if (Math.abs(d) < 1e-4) {
+                            return d < 0 ? -1e-4 : 1e-4;
+                        }
+                        return d;
+                    })(),
+                };
+                const cpx = Number(o.cam_pos_x);
+                const cpy = Number(o.cam_pos_y);
+                const cpz = Number(o.cam_pos_z);
+                if (Number.isFinite(cpx) && Number.isFinite(cpy) && Number.isFinite(cpz)) {
+                    out.cam_pos_x = cpx;
+                    out.cam_pos_y = cpy;
+                    out.cam_pos_z = cpz;
+                }
+                for (let i = 0; i < 3; i++) {
+                    for (let j = 0; j < 3; j++) {
+                        const key = `cam_r${i}${j}`;
+                        const v = Number(o[key]);
+                        if (Number.isFinite(v)) {
+                            out[key] = v;
+                        }
+                    }
+                }
+                return out;
+            } catch (_) {
+                return null;
+            }
+        }
+
         function parameterStateFromUi(state) {
             const fallback = parseJson(uiPayload?.parameter_camera_state?.[0] || "{}", {});
             const pivot = {
@@ -909,7 +960,7 @@
             const procIdle = (
                 Math.abs(dx) < 1e-8 && Math.abs(dy) < 1e-8 && Math.abs(dz) < 1e-8
                 && Math.abs(dyaw) < 1e-8 && Math.abs(dpitch) < 1e-8 && Math.abs(droll) < 1e-8
-                && Math.abs(lpitch) < 1e-8 && Math.abs(lyaw) < 1e-8 && Math.abs(lroll) < 1e-8
+                && Math.abs(lpitch) < 1e-8 && Math.abs(lyaw) < 1e-8
             );
             const baseD = Number(base.distance);
             if (
@@ -1386,14 +1437,31 @@
             nodeState = message.state || {};
             lastLockState = isCameraLocked();
             setLockOverlay(lastLockState);
+            const nodeStateSignature = JSON.stringify(nodeState || {});
 
             if (!wasLocked && lastLockState && currentPreviewState) {
                 postCameraState(true, true);
             }
 
             if (lastLockState) {
-                currentPreviewState = proceduralStateFromUi(nodeState);
-                applyCameraState(currentPreviewState);
+                const rasterRaw = uiPayload?.raster_camera_state?.[0];
+                const hasFreshRaster = typeof rasterRaw === "string" && rasterRaw && rasterRaw !== lastServerRasterCameraJson;
+                const shouldReuseRaster = typeof rasterRaw === "string" && rasterRaw && nodeStateSignature === lastLockedRasterStateSignature;
+                if (hasFreshRaster || shouldReuseRaster) {
+                    const rasterState = parseServerCameraState(rasterRaw);
+                    if (rasterState) {
+                        lastServerRasterCameraJson = rasterRaw;
+                        lastLockedRasterStateSignature = nodeStateSignature;
+                        currentPreviewState = rasterState;
+                        applyCameraState(currentPreviewState);
+                    } else {
+                        currentPreviewState = proceduralStateFromUi(nodeState);
+                        applyCameraState(currentPreviewState);
+                    }
+                } else {
+                    currentPreviewState = proceduralStateFromUi(nodeState);
+                    applyCameraState(currentPreviewState);
+                }
             } else if (!currentPreviewState || wasLocked) {
                 currentPreviewState = interactiveStateFromUi(nodeState);
                 applyCameraState(currentPreviewState);
@@ -1412,48 +1480,13 @@
                 && snap
                 && snap !== lastServerPreviewCameraJson
             ) {
-                lastServerPreviewCameraJson = snap;
-                try {
-                    const o = JSON.parse(snap);
-                    currentPreviewState = {
-                        pivot_x: Number(o.pivot_x) || 0,
-                        pivot_y: Number(o.pivot_y) || 0,
-                        pivot_z: Number(o.pivot_z) || 0,
-                        yaw_deg: Number(o.yaw_deg) || 0,
-                        pitch_deg: Number(o.pitch_deg) || 0,
-                        roll_deg: Number(o.roll_deg) || 0,
-                        distance: (() => {
-                            const d = Number(o.distance);
-                            if (!Number.isFinite(d)) {
-                                return 1e-4;
-                            }
-                            if (Math.abs(d) < 1e-4) {
-                                return d < 0 ? -1e-4 : 1e-4;
-                            }
-                            return d;
-                        })(),
-                    };
-                    const cpx = Number(o.cam_pos_x);
-                    const cpy = Number(o.cam_pos_y);
-                    const cpz = Number(o.cam_pos_z);
-                    if (Number.isFinite(cpx) && Number.isFinite(cpy) && Number.isFinite(cpz)) {
-                        currentPreviewState.cam_pos_x = cpx;
-                        currentPreviewState.cam_pos_y = cpy;
-                        currentPreviewState.cam_pos_z = cpz;
-                    }
-                    for (let i = 0; i < 3; i++) {
-                        for (let j = 0; j < 3; j++) {
-                            const key = `cam_r${i}${j}`;
-                            const v = Number(o[key]);
-                            if (Number.isFinite(v)) {
-                                currentPreviewState[key] = v;
-                            }
-                        }
-                    }
+                const previewState = parseServerCameraState(snap);
+                if (previewState) {
+                    lastServerPreviewCameraJson = snap;
+                    lastLockedRasterStateSignature = "";
+                    currentPreviewState = previewState;
                     applyCameraState(currentPreviewState);
                     requestRender(24);
-                } catch (_) {
-                    /* ignore malformed */
                 }
             }
 

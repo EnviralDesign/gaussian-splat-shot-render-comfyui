@@ -857,6 +857,13 @@ class GaussianShotRenderNode:
                         "tooltip": "Show the interactive viewer info overlay (camera, pivot, resolution).",
                     },
                 ),
+                "enable_viewer": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Mount the interactive viewer iframe. Disable to fully unload the viewer UI and WebGL context for this node.",
+                    },
+                ),
                 "seed": (
                     "INT",
                     {
@@ -946,6 +953,7 @@ class GaussianShotRenderNode:
         output_height: int,
         use_source_resolution: bool,
         show_viewer_hud: bool,
+        enable_viewer: bool,
         seed: int,
         rand_tx_min: float,
         rand_tx_max: float,

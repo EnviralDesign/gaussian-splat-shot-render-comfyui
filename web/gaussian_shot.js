@@ -70,7 +70,7 @@ function widgetFiniteFloat(node, name, fallback = 0) {
 }
 
 function ensureWidgetDefaults(node) {
-    const comboDefaults = [["background", "black", ["black", "white"]]];
+    const comboDefaults = [["background", "black", ["black", "mid-gray", "white"]]];
     for (const [name, fallback, valid] of comboDefaults) {
         const value = getWidgetValue(node, name, fallback);
         if (!valid.includes(value)) {
@@ -101,6 +101,7 @@ function ensureWidgetDefaults(node) {
 
 function buildViewerState(node) {
     return {
+        enable_viewer: !!getWidgetValue(node, "enable_viewer", true),
         camera_locked: !!getWidgetValue(node, "camera_locked", false),
         pivot_x: widgetFiniteFloat(node, "pivot_x", 0),
         pivot_y: widgetFiniteFloat(node, "pivot_y", 0),
@@ -128,8 +129,6 @@ function buildViewerState(node) {
         rand_loc_pitch_max: widgetFiniteFloat(node, "rand_loc_pitch_max", 0),
         rand_loc_yaw_min: widgetFiniteFloat(node, "rand_loc_yaw_min", 0),
         rand_loc_yaw_max: widgetFiniteFloat(node, "rand_loc_yaw_max", 0),
-        rand_loc_roll_min: widgetFiniteFloat(node, "rand_loc_roll_min", 0),
-        rand_loc_roll_max: widgetFiniteFloat(node, "rand_loc_roll_max", 0),
         max_gaussians: (() => {
             const v = parseInt(getWidgetValue(node, "max_gaussians", 0), 10);
             return Number.isFinite(v) ? v : 0;
@@ -178,14 +177,6 @@ app.registerExtension({
             container.style.overflow = "hidden";
             container.style.background = "#111";
 
-            const iframe = document.createElement("iframe");
-            iframe.style.width = "100%";
-            iframe.style.height = "100%";
-            iframe.style.border = "none";
-            iframe.style.background = "#111";
-            iframe.src = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian_shot.html?v=${Date.now()}`;
-            container.appendChild(iframe);
-
             this.addDOMWidget("gaussian_shot_viewer", "GAUSSIAN_SHOT_VIEWER", container, {
                 getValue() {
                     return "";
@@ -204,19 +195,76 @@ app.registerExtension({
             }
             this.setDirtyCanvas?.(true, true);
 
-            this.gaussianShotIframe = iframe;
+            this.gaussianShotIframe = null;
             this.gaussianShotUi = null;
             this.gaussianShotLoaded = false;
             this.gaussianShotLastSignature = "";
             this.gaussianShotWasLocked = !!getWidgetValue(this, "camera_locked", false);
 
-            iframe.addEventListener("load", () => {
-                this.gaussianShotLoaded = true;
-                this.gaussianShotSendState(true);
-            });
+            const setViewerMounted = (enabled) => {
+                container.style.display = enabled ? "flex" : "none";
+                container.style.minHeight = enabled ? "420px" : "0";
+                container.style.height = enabled ? "100%" : "0";
+                if (viewerWidget) {
+                    viewerWidget.hidden = !enabled;
+                }
+                this.setDirtyCanvas?.(true, true);
+            };
+
+            const unloadViewer = () => {
+                const existing = this.gaussianShotIframe;
+                this.gaussianShotLoaded = false;
+                this.gaussianShotLastSignature = "";
+                if (!existing) {
+                    setViewerMounted(false);
+                    return;
+                }
+                try {
+                    existing.src = "about:blank";
+                } catch (_) {
+                    /* ignore navigation failures during teardown */
+                }
+                existing.remove();
+                this.gaussianShotIframe = null;
+                setViewerMounted(false);
+            };
+
+            const mountViewer = () => {
+                if (this.gaussianShotIframe) {
+                    setViewerMounted(true);
+                    return;
+                }
+                const iframe = document.createElement("iframe");
+                iframe.style.width = "100%";
+                iframe.style.height = "100%";
+                iframe.style.border = "none";
+                iframe.style.background = "#111";
+                iframe.src = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian_shot.html?v=${Date.now()}`;
+                iframe.addEventListener("load", () => {
+                    if (this.gaussianShotIframe !== iframe) {
+                        return;
+                    }
+                    this.gaussianShotLoaded = true;
+                    this.gaussianShotSendState(true);
+                });
+                this.gaussianShotIframe = iframe;
+                container.appendChild(iframe);
+                setViewerMounted(true);
+            };
+
+            this.gaussianShotSyncViewerEnabled = () => {
+                const enabled = !!getWidgetValue(this, "enable_viewer", true);
+                if (enabled) {
+                    mountViewer();
+                } else {
+                    unloadViewer();
+                }
+            };
 
             this.gaussianShotSendState = (force = false) => {
-                if (!this.gaussianShotLoaded || !iframe.contentWindow) {
+                const enabled = !!getWidgetValue(this, "enable_viewer", true);
+                const iframe = this.gaussianShotIframe;
+                if (!enabled || !this.gaussianShotLoaded || !iframe?.contentWindow) {
                     return;
                 }
                 const state = buildViewerState(this);
@@ -229,11 +277,27 @@ app.registerExtension({
                 iframe.contentWindow.postMessage({ type: "GAUSSIAN_SHOT_STATE", ui, state }, "*");
             };
 
-            this.gaussianShotPoll = setInterval(() => this.gaussianShotSendState(false), 150);
+            this.gaussianShotSyncViewerEnabled();
+            this.gaussianShotPoll = setInterval(() => {
+                this.gaussianShotSyncViewerEnabled?.();
+                this.gaussianShotSendState(false);
+            }, 150);
 
             const onRemoved = this.onRemoved;
             this.onRemoved = function () {
                 clearInterval(this.gaussianShotPoll);
+                this.gaussianShotSyncViewerEnabled = null;
+                this.gaussianShotLoaded = false;
+                this.gaussianShotLastSignature = "";
+                if (this.gaussianShotIframe) {
+                    try {
+                        this.gaussianShotIframe.src = "about:blank";
+                    } catch (_) {
+                        /* ignore navigation failures during teardown */
+                    }
+                    this.gaussianShotIframe.remove();
+                    this.gaussianShotIframe = null;
+                }
                 return onRemoved ? onRemoved.apply(this, arguments) : undefined;
             };
 
