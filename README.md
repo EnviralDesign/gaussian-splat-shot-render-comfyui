@@ -57,3 +57,11 @@ cmd /c mklink /J "D:\ComfyUI\custom_nodes\gaussian-splat-shot-render-comfyui" "C
 
 See **`LICENSE`** (MIT for original project code) and **`THIRD_PARTY_NOTICES.md`**
 (Apple SHARP, GPL-3.0 wrapper nodes, bundled `gsplat-bundle.js`, HF Hub, model weights).
+
+## Donations & Support
+
+If this saves you time, you can support the work here:
+
+- [Patreon](https://www.patreon.com/EnviralDesign)
+- [GitHub Sponsors](https://github.com/sponsors/EnviralDesign)
+- [PayPal](https://www.paypal.com/donate?hosted_button_id=RP8EJAHSDTZ86)
