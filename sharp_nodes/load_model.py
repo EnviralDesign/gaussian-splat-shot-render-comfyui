@@ -13,10 +13,46 @@ try:
     import folder_paths
     MODELS_DIR = os.path.join(folder_paths.models_dir, "sharp")
 except ImportError:
+    folder_paths = None
     MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "sharp")
 
 SHARP_REPO_ID = "apple/Sharp"
 SHARP_FILENAME = "sharp_2572gikvuh.pt"
+WARM_READ_CHUNK_SIZE = 32 * 1024 * 1024
+
+
+def _sharp_model_dirs():
+    if folder_paths is not None:
+        try:
+            return folder_paths.get_folder_paths("sharp")
+        except KeyError:
+            pass
+    return [MODELS_DIR]
+
+
+def _resolve_sharp_checkpoint():
+    for model_dir in _sharp_model_dirs():
+        model_path = os.path.join(model_dir, SHARP_FILENAME)
+        if os.path.exists(model_path):
+            return model_path
+    return None
+
+
+def _is_external_model_path(model_path):
+    model_drive = os.path.splitdrive(os.path.abspath(model_path))[0].upper()
+    local_drive = os.path.splitdrive(os.path.abspath(MODELS_DIR))[0].upper()
+    return bool(model_drive and model_drive != local_drive)
+
+
+def _warm_file_cache(model_path):
+    if not _is_external_model_path(model_path):
+        return
+
+    file_size = os.path.getsize(model_path)
+    log.info(f"Warming SHARP checkpoint cache ({file_size / (1024 ** 3):.2f} GiB)")
+    with open(model_path, "rb") as checkpoint:
+        while checkpoint.read(WARM_READ_CHUNK_SIZE):
+            pass
 
 
 class LoadSharpModel:
@@ -82,12 +118,16 @@ class LoadSharpModel:
         if checkpoint_path and os.path.exists(checkpoint_path):
             model_path = checkpoint_path
         else:
-            os.makedirs(MODELS_DIR, exist_ok=True)
+            model_path = _resolve_sharp_checkpoint()
+        if model_path is None:
+            download_dir = _sharp_model_dirs()[0]
+            os.makedirs(download_dir, exist_ok=True)
             model_path = hf_hub_download(
                 repo_id=SHARP_REPO_ID,
                 filename=SHARP_FILENAME,
-                local_dir=MODELS_DIR,
+                local_dir=download_dir,
             )
+        _warm_file_cache(model_path)
 
         # Load state dict
         log.info(f"Loading checkpoint from {model_path}")
